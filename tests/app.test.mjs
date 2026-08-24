@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import {
   calendarDays,
   categoryTotals,
@@ -46,5 +47,18 @@ test("aggregates categories and words from private notes", () => {
   assert.equal(categoryTotals(sessions).luz, 1500);
   assert.equal(categoryTotals(sessions).sonido, 1200);
   assert.deepEqual(wordFrequencies(sessions, 2).map((item) => item.word), ["calma", "claridad"]);
+});
+
+test("numeric controls persist on input without rebuilding the active screen", async () => {
+  const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
+  const helper = source.slice(source.indexOf("function bindBoundedNumber"), source.indexOf("function bindMeditateEvents"));
+  assert.match(helper, /addEventListener\("input"/);
+  assert.match(helper, /addEventListener\("blur"/);
+  assert.doesNotMatch(helper, /render\(\)/);
+
+  const settingsBindings = source.slice(source.indexOf("function bindSettingsEvents"), source.indexOf("function renderModal"));
+  const numericBindings = settingsBindings.slice(0, settingsBindings.indexOf('document.querySelectorAll("[data-setting-select]"'));
+  assert.match(numericBindings, /bindBoundedNumber/);
+  assert.doesNotMatch(numericBindings, /render\(\)/);
 });
 
