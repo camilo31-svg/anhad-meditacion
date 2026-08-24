@@ -119,6 +119,7 @@ let wakeLock = null;
 let installPrompt = null;
 let audioContext = null;
 let ambientNodes = [];
+let storageWarningShown = false;
 
 const ui = {
   view: runtime ? "meditar" : "meditar",
@@ -137,13 +138,35 @@ const ui = {
 const app = document.querySelector("#app");
 const toastRegion = document.querySelector("#toast-region");
 
-function saveState() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+function showStorageWarning() {
+  if (storageWarningShown) return;
+  storageWarningShown = true;
+  toast("No queda espacio para guardar más datos. Exporta una copia o elimina el fondo y sonido propios.", "warning");
+}
+
+function saveState({ notify = true } = {}) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    storageWarningShown = false;
+    return true;
+  } catch (error) {
+    console.warn("Anhad no pudo guardar el estado local.", error);
+    if (notify) showStorageWarning();
+    return false;
+  }
 }
 
 function saveRuntime() {
-  if (runtime) localStorage.setItem(RUNTIME_KEY, JSON.stringify(runtime));
-  else localStorage.removeItem(RUNTIME_KEY);
+  try {
+    if (runtime) localStorage.setItem(RUNTIME_KEY, JSON.stringify(runtime));
+    else localStorage.removeItem(RUNTIME_KEY);
+    storageWarningShown = false;
+    return true;
+  } catch (error) {
+    console.warn("Anhad no pudo guardar el temporizador local.", error);
+    showStorageWarning();
+    return false;
+  }
 }
 
 function escapeHtml(value = "") {
@@ -368,7 +391,28 @@ function advancedStep(step, index) {
 
 function startArea(total) {
   return `<button class="start-button" type="button" data-action="start-session"><span>${state.advanced.openEnded && state.mode === "advanced" ? "Comenzar sesión abierta" : "Comenzar meditación"}</span><b>→</b></button>
-    <p class="bell-note">${state.settings.bell === "silencio" ? "Transiciones por vibración, sin sonido" : "Una campana suave marcará cada transición"} · ${total || 0} min</p>`;
+    <p class="bell-note">${state.settings.bell === "silencio" ? "Transiciones por vibración, sin sonido" : "Una campana suave marcará cada transición"} · <span data-meditation-total>${total || 0} min</span></p>`;
+}
+
+function updateMeditationTotals() {
+  const total = state.mode === "simple" ? simpleTotalMinutes() : advancedCycleMinutes() * state.advanced.rounds;
+  const totalDuration = document.querySelector("#total-duration");
+  const totalNote = document.querySelector("[data-meditation-total]");
+  if (totalDuration) totalDuration.textContent = `${total} min`;
+  if (totalNote) totalNote.textContent = `${total || 0} min`;
+}
+
+function bindBoundedNumber(input, min, max, onValue, onUpdate = () => {}) {
+  const applyValue = ({ normalize = false } = {}) => {
+    if (input.value === "" && !normalize) return;
+    const value = clamp(input.value, min, max);
+    onValue(value);
+    if (normalize) input.value = value;
+    saveState();
+    onUpdate(value);
+  };
+  input.addEventListener("input", () => applyValue());
+  input.addEventListener("blur", () => applyValue({ normalize: true }));
 }
 
 function bindMeditateEvents() {
@@ -377,22 +421,25 @@ function bindMeditateEvents() {
     saveState();
     render();
   }));
-  document.querySelectorAll("[data-simple]").forEach((input) => input.addEventListener("change", () => {
-    state.simple[input.dataset.simple] = clamp(input.value, 1, 720);
-    saveState();
-    render();
-  }));
-  document.querySelectorAll("[data-step-minutes]").forEach((input) => input.addEventListener("change", () => {
+  document.querySelectorAll("[data-simple]").forEach((input) => bindBoundedNumber(input, 1, 720, (value) => {
+    state.simple[input.dataset.simple] = value;
+  }, updateMeditationTotals));
+  document.querySelectorAll("[data-step-minutes]").forEach((input) => bindBoundedNumber(input, 1, 720, (value) => {
     const step = state.advanced.steps.find((item) => item.id === input.dataset.stepMinutes);
-    if (step) step.minutes = clamp(input.value, 1, 720);
-    saveState();
-    render();
-  }));
+    if (step) step.minutes = value;
+  }, updateMeditationTotals));
   document.querySelectorAll("[data-step-category]").forEach((select) => select.addEventListener("change", () => {
     const step = state.advanced.steps.find((item) => item.id === select.dataset.stepCategory);
-    if (step) step.category = select.value;
+    if (step) {
+      step.category = select.value;
+      const article = select.closest("[data-step-id]");
+      const meta = CATEGORY_META[step.category];
+      article?.classList.remove(...Object.values(CATEGORY_META).map((item) => item.className));
+      article?.classList.add(meta.className);
+      const icon = article?.querySelector(".phase-icon");
+      if (icon) icon.textContent = meta.icon;
+    }
     saveState();
-    render();
   }));
   document.querySelectorAll("[data-round]").forEach((button) => button.addEventListener("click", () => {
     state.advanced.rounds = clamp(state.advanced.rounds + (button.dataset.round === "plus" ? 1 : -1), 1, 99);
@@ -417,7 +464,8 @@ function bindMeditateEvents() {
   document.querySelector('[data-setting="openEnded"]')?.addEventListener("change", (event) => {
     state.advanced.openEnded = event.target.checked;
     saveState();
-    render();
+    const startLabel = document.querySelector('[data-action="start-session"] span');
+    if (startLabel) startLabel.textContent = event.target.checked ? "Comenzar sesión abierta" : "Comenzar meditación";
   });
   document.querySelector('[data-action="choose-category"]')?.addEventListener("click", () => {
     ui.modal = "category";
@@ -865,7 +913,7 @@ function renderSettings() {
     <div class="section-heading"><div><p class="eyebrow">A TU MANERA</p><h1>Ajustes</h1></div></div>
     <section class="settings-section"><div class="settings-heading"><span>◎</span><div><h2>Objetivos</h2><p>Se mantienen iguales cada día</p></div></div>
       <div class="two-fields"><label>Objetivo diario<div class="unit-input"><input type="number" min="1" max="1440" value="${state.settings.dailyGoal}" data-setting-number="dailyGoal" /><span>min</span></div></label><label>Objetivo semanal<div class="unit-input"><input type="number" min="1" max="10080" value="${state.settings.weeklyGoal}" data-setting-number="weeklyGoal" /><span>min</span></div></label></div>
-      <div class="goal-comparison"><span>Esta semana <b>${formatMinutes(weekSeconds(), { compact: true })}</b></span><div class="goal-track"><span style="width:${clamp(weekSeconds() / (state.settings.weeklyGoal * 60) * 100, 0, 100)}%"></span></div></div>
+      <div class="goal-comparison"><span>Esta semana <b>${formatMinutes(weekSeconds(), { compact: true })}</b></span><div class="goal-track"><span data-weekly-progress style="width:${clamp(weekSeconds() / (state.settings.weeklyGoal * 60) * 100, 0, 100)}%"></span></div></div>
     </section>
     <section class="settings-section"><div class="settings-heading"><span>⏰</span><div><h2>Alarmas de práctica</h2><p>Recordatorios en este móvil</p></div><button class="small-add" type="button" data-action="add-reminder">＋</button></div>
       ${state.reminders.length ? `<div class="reminder-list">${state.reminders.map(reminderRow).join("")}</div>` : '<div class="empty-inline"><span>○</span><p>No has creado ninguna alarma.</p></div>'}
@@ -874,7 +922,7 @@ function renderSettings() {
     </section>
     <section class="settings-section"><div class="settings-heading"><span>♩</span><div><h2>Campanas y ambiente</h2><p>Todos los sonidos funcionan offline</p></div></div>
       <div class="field-grid"><label>Campana<select data-setting-select="bell">${[["cuenco", "Cuenco tibetano"], ["tibetana", "Campana tibetana"], ["gong", "Gong grave"], ["cristal", "Cuenco de cristal"], ["silencio", "Silencio + vibración"], ["custom", "Sonido propio"]].map(([value, label]) => `<option value="${value}" ${state.settings.bell === value ? "selected" : ""}>${label}</option>`).join("")}</select></label><label>Ambiente<select data-setting-select="ambient">${[["none", "Ninguno"], ["rain", "Lluvia"], ["forest", "Bosque"], ["ocean", "Océano"], ["wind", "Viento"], ["fireplace", "Chimenea"], ["birds", "Aves"]].map(([value, label]) => `<option value="${value}" ${state.settings.ambient === value ? "selected" : ""}>${label}</option>`).join("")}</select></label></div>
-      <label class="range-field">Volumen <input type="range" min="0" max="1" step="0.05" value="${state.settings.volume}" data-setting-number="volume" /><b>${Math.round(state.settings.volume * 100)}%</b></label>
+      <label class="range-field">Volumen <input type="range" min="0" max="1" step="0.05" value="${state.settings.volume}" data-setting-number="volume" /><b data-volume-value>${Math.round(state.settings.volume * 100)}%</b></label>
       <div class="field-grid"><label>Repeticiones<select data-setting-select="bellRepeats">${[1,2,3].map((value) => `<option value="${value}" ${Number(state.settings.bellRepeats) === value ? "selected" : ""}>${value} ${value === 1 ? "toque" : "toques"}</option>`).join("")}</select></label><label>Intervalo adicional<select data-setting-select="intervalMinutes">${[[0, "Sin intervalo"], [5, "Cada 5 min"], [10, "Cada 10 min"], [15, "Cada 15 min"], [30, "Cada 30 min"]].map(([value, label]) => `<option value="${value}" ${Number(state.settings.intervalMinutes) === value ? "selected" : ""}>${label}</option>`).join("")}</select></label></div>
       <div class="button-row"><button class="secondary-button" type="button" data-action="test-bell">Probar campana</button><label class="file-button">Cargar sonido<input type="file" accept="audio/*" data-file="bell" /></label></div>
       ${toggleRow("Campana de inicio", "startBell", state.settings.startBell)}${toggleRow("Campana final", "endBell", state.settings.endBell)}${toggleRow("Entrada gradual", "fadeIn", state.settings.fadeIn)}${toggleRow("Vibración", "vibration", state.settings.vibration)}
@@ -915,18 +963,24 @@ function reminderRow(reminder) {
 }
 
 function bindSettingsEvents() {
-  document.querySelectorAll("[data-setting-number]").forEach((input) => input.addEventListener("change", () => {
+  document.querySelectorAll("[data-setting-number]").forEach((input) => {
     const key = input.dataset.settingNumber;
-    if (key === "volume") state.settings[key] = clamp(input.value, 0, 1);
-    else state.settings[key] = clamp(input.value, 1, key === "weeklyGoal" ? 10080 : 1440);
-    saveState();
-    render();
-  }));
+    const min = key === "volume" ? 0 : 1;
+    const max = key === "volume" ? 1 : key === "weeklyGoal" ? 10080 : 1440;
+    bindBoundedNumber(input, min, max, (value) => {
+      state.settings[key] = value;
+    }, (value) => {
+      if (key === "volume") document.querySelector("[data-volume-value]")?.replaceChildren(`${Math.round(value * 100)}%`);
+      if (key === "weeklyGoal") {
+        const progress = document.querySelector("[data-weekly-progress]");
+        if (progress) progress.style.width = `${clamp(weekSeconds() / (value * 60) * 100, 0, 100)}%`;
+      }
+    });
+  });
   document.querySelectorAll("[data-setting-select]").forEach((select) => select.addEventListener("change", () => {
     const key = select.dataset.settingSelect;
     state.settings[key] = ["bellRepeats", "intervalMinutes"].includes(key) ? Number(select.value) : select.value;
     saveState();
-    render();
   }));
   document.querySelectorAll("[data-setting-toggle]").forEach((input) => input.addEventListener("change", () => {
     state.settings[input.dataset.settingToggle] = input.checked;
@@ -935,17 +989,19 @@ function bindSettingsEvents() {
   document.querySelectorAll("[data-direction]").forEach((button) => button.addEventListener("click", () => {
     state.settings.direction = button.dataset.direction;
     saveState();
-    render();
+    document.querySelectorAll("[data-direction]").forEach((item) => item.classList.toggle("active", item === button));
   }));
   document.querySelectorAll("[data-theme]").forEach((button) => button.addEventListener("click", () => {
     state.settings.theme = button.dataset.theme;
     saveState();
-    render();
+    document.querySelectorAll("[data-theme]").forEach((item) => item.classList.toggle("selected", item === button));
+    setTheme();
   }));
   document.querySelectorAll("[data-background]").forEach((button) => button.addEventListener("click", () => {
     state.settings.background = button.dataset.background;
     saveState();
-    render();
+    document.querySelectorAll("[data-background]").forEach((item) => item.classList.toggle("selected", item === button));
+    setTheme();
   }));
   document.querySelector('[data-action="test-bell"]')?.addEventListener("click", () => playBell(state.settings.bell, state.settings.bellRepeats));
   document.querySelector('[data-action="notifications"]')?.addEventListener("click", requestNotifications);
@@ -1317,9 +1373,14 @@ async function fileAsDataUrl(file, maxBytes) {
 
 async function loadCustomBell(event) {
   try {
+    const previous = { customBell: state.settings.customBell, bell: state.settings.bell };
     state.settings.customBell = await fileAsDataUrl(event.target.files[0], 1.5 * 1024 * 1024);
     state.settings.bell = "custom";
-    saveState();
+    if (!saveState({ notify: false })) {
+      Object.assign(state.settings, previous);
+      saveState({ notify: false });
+      throw new Error("No hay espacio suficiente para guardar este sonido.");
+    }
     toast("Sonido propio guardado en este dispositivo.", "success");
     render();
   } catch (error) { toast(error.message, "warning"); }
@@ -1327,9 +1388,14 @@ async function loadCustomBell(event) {
 
 async function loadBackground(event) {
   try {
+    const previous = { customBackground: state.settings.customBackground, background: state.settings.background };
     state.settings.customBackground = await fileAsDataUrl(event.target.files[0], 2 * 1024 * 1024);
     state.settings.background = "custom";
-    saveState();
+    if (!saveState({ notify: false })) {
+      Object.assign(state.settings, previous);
+      saveState({ notify: false });
+      throw new Error("No hay espacio suficiente para guardar esta imagen.");
+    }
     toast("Fondo guardado en este dispositivo.", "success");
     render();
   } catch (error) { toast(error.message, "warning"); }
@@ -1342,8 +1408,12 @@ async function importData(event) {
     const parsed = JSON.parse(await file.text());
     if (!parsed || !Array.isArray(parsed.sessions)) throw new Error("La copia no parece válida.");
     if (!confirm(`Se importarán ${parsed.sessions.length} sesiones y se reemplazarán los ajustes actuales. ¿Continuar?`)) return;
+    const previous = state;
     state = hydrate(parsed);
-    saveState();
+    if (!saveState({ notify: false })) {
+      state = previous;
+      throw new Error("No hay espacio suficiente para importar esta copia.");
+    }
     toast("Copia importada correctamente.", "success");
     render();
   } catch (error) { toast(error.message || "No se pudo importar la copia.", "warning"); }
