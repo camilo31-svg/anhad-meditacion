@@ -62,3 +62,22 @@ test("numeric controls persist on input without rebuilding the active screen", a
   assert.doesNotMatch(numericBindings, /render\(\)/);
 });
 
+test("offline shell precaches the app and falls back for navigations", async () => {
+  const worker = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
+  assert.match(worker, /anhad-offline-v3/);
+  assert.match(worker, /cache\.addAll\(requests\)/);
+  assert.match(worker, /event\.request\.mode === "navigate"/);
+  assert.match(worker, /ignoreSearch: true/);
+  assert.match(worker, /cache\.match\(offlineUrl\)/);
+});
+
+test("mobile audio primes playback and schedules transition bells", async () => {
+  const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
+  assert.match(source, /function scheduleSessionBells/);
+  assert.match(source, /function startSessionAudio/);
+  assert.match(source, /navigator\.mediaSession/);
+  assert.match(source, /indexedDB\.open\("anhad-media"/);
+  assert.match(source, /audio\/\*,\.mp3,\.m4a,\.wav,\.aac,\.ogg,\.oga,\.flac/);
+  assert.match(source, /data-action="test-bell"/);
+});
+
