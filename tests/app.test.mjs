@@ -64,7 +64,7 @@ test("numeric controls persist on input without rebuilding the active screen", a
 
 test("offline shell precaches the app and falls back for navigations", async () => {
   const worker = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
-  assert.match(worker, /anhad-offline-v3/);
+  assert.match(worker, /anhad-offline-v4/);
   assert.match(worker, /cache\.addAll\(requests\)/);
   assert.match(worker, /event\.request\.mode === "navigate"/);
   assert.match(worker, /ignoreSearch: true/);
@@ -79,5 +79,17 @@ test("mobile audio primes playback and schedules transition bells", async () => 
   assert.match(source, /indexedDB\.open\("anhad-media"/);
   assert.match(source, /audio\/\*,\.mp3,\.m4a,\.wav,\.aac,\.ogg,\.oga,\.flac/);
   assert.match(source, /data-action="test-bell"/);
+  assert.match(source, /const backgroundPlayback = startSessionAudio\(\)/);
+  assert.match(source, /playBell\(state\.settings\.bell, state\.settings\.bellRepeats, \{ nodes: previewBellNodes \}\)/);
+  assert.match(source, /addEventListener\("timeupdate"/);
+});
+
+test("lock-screen timer follows the active meditation phase", async () => {
+  const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
+  const mediaSession = source.slice(source.indexOf("function updateMediaSession"), source.indexOf("function sessionNotificationBody"));
+  assert.match(mediaSession, /const duration = phase\.durationSec/);
+  assert.match(mediaSession, /position: clamp\(currentPhaseElapsed\(\), 0, duration\)/);
+  assert.doesNotMatch(mediaSession, /totalElapsed/);
+  assert.match(source, /Volviendo a<br \/>Sach Khand/);
 });
 
