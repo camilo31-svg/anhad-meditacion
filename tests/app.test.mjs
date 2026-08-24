@@ -64,7 +64,7 @@ test("numeric controls persist on input without rebuilding the active screen", a
 
 test("offline shell precaches the app and falls back for navigations", async () => {
   const worker = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
-  assert.match(worker, /anhad-offline-v4/);
+  assert.match(worker, /anhad-offline-v5/);
   assert.match(worker, /cache\.addAll\(requests\)/);
   assert.match(worker, /event\.request\.mode === "navigate"/);
   assert.match(worker, /ignoreSearch: true/);
@@ -82,6 +82,12 @@ test("mobile audio primes playback and schedules transition bells", async () => 
   assert.match(source, /const backgroundPlayback = startSessionAudio\(\)/);
   assert.match(source, /playBell\(state\.settings\.bell, state\.settings\.bellRepeats, \{ nodes: previewBellNodes \}\)/);
   assert.match(source, /addEventListener\("timeupdate"/);
+  assert.match(source, /function synthesizedBellBlob/);
+  assert.match(source, /function primeLockScreenBell/);
+  assert.match(source, /function playLockScreenBell/);
+  assert.match(source, /playSessionBell\(1\)/);
+  assert.match(source, /playSessionBell\(state\.settings\.bellRepeats\)/);
+  assert.match(source, /if \(phaseChanged\) \{[\s\S]*?render\(\);[\s\S]*?return;/);
 });
 
 test("lock-screen timer follows the active meditation phase", async () => {
