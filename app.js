@@ -128,6 +128,8 @@ let sessionAudio = null;
 let scheduledBellNodes = [];
 let sessionBellsScheduled = false;
 let bellScheduleGeneration = 0;
+let previewBellNodes = [];
+let previewStopHandle = null;
 let customBellBuffer = null;
 let audioWarningShown = false;
 
@@ -324,7 +326,7 @@ function renderMeditate() {
         <p class="eyebrow">${greeting.toUpperCase()} · ${escapeHtml(profile.name.toUpperCase())}</p>
         <span class="offline-chip"><i></i><span data-offline-status>${offlineStatusText()}</span></span>
       </div>
-      <h1 id="timer-title">Tiempo para volver<br />a tu centro.</h1>
+      <h1 id="timer-title">Volviendo a<br />Sach Khand</h1>
 
       <button class="goal-card" type="button" data-nav="calendario" aria-label="Ver progreso diario">
         <div class="goal-meta"><span>Objetivo diario</span><strong>${Math.round(today / 60)} <small>/ ${state.settings.dailyGoal} min</small></strong></div>
@@ -518,6 +520,7 @@ function sequenceForCurrentMode() {
 async function startSession() {
   const sequence = sequenceForCurrentMode();
   if (!sequence.length) return toast("Añade al menos un paso.", "warning");
+  stopBellPreview({ releaseRoute: false });
   const backgroundPlayback = state.settings.sessionNotification ? startSessionAudio() : Promise.resolve(false);
   const audioReady = ensureAudio();
   const notificationPermission = state.settings.sessionNotification ? requestNotifications({ quiet: true }) : Promise.resolve(false);
@@ -1369,13 +1372,13 @@ async function scheduleBellAt(type, repeats, startAt, { nodes = null } = {}) {
   return true;
 }
 
-async function playBell(type = "cuenco", repeats = 1) {
+async function playBell(type = "cuenco", repeats = 1, { nodes = null } = {}) {
   if (type === "silencio") {
     if (state.settings.vibration) navigator.vibrate?.([180, 80, 180]);
     return true;
   }
   const context = await ensureAudio();
-  await scheduleBellAt(type, repeats, context.currentTime + 0.035);
+  await scheduleBellAt(type, repeats, context.currentTime + 0.035, { nodes });
   audioWarningShown = false;
   if (state.settings.vibration) navigator.vibrate?.(160);
   return true;
@@ -1384,11 +1387,29 @@ async function playBell(type = "cuenco", repeats = 1) {
 async function testBell(event) {
   const button = event.currentTarget;
   button.disabled = true;
+  stopBellPreview();
   try {
-    await ensureAudio();
-    await playBell(state.settings.bell, state.settings.bellRepeats);
-    toast("Sonido de prueba reproducido.", "success");
+    if (state.settings.bell === "silencio") {
+      await playBell(state.settings.bell, state.settings.bellRepeats);
+      toast("Vibración de prueba activada.", "success");
+      return;
+    }
+
+    // Claim the same mobile audio route used by an active meditation while
+    // the click still counts as a user gesture. Some phones mute previews
+    // that use Web Audio alone even though session bells work normally.
+    const backgroundPlayback = startSessionAudio();
+    const audioReady = ensureAudio();
+    const [routeReady] = await Promise.all([backgroundPlayback, audioReady]);
+    await playBell(state.settings.bell, state.settings.bellRepeats, { nodes: previewBellNodes });
+
+    if (routeReady && !runtime) {
+      const durationMs = Math.ceil(previewDurationSeconds(state.settings.bell, state.settings.bellRepeats) * 1000) + 350;
+      previewStopHandle = window.setTimeout(() => stopBellPreview(), durationMs);
+    }
+    toast("Reproduciendo sonido de prueba.", "success");
   } catch (error) {
+    stopBellPreview();
     showAudioError(error);
   } finally {
     button.disabled = false;
@@ -1397,6 +1418,24 @@ async function testBell(event) {
 
 function stopBellNodes(nodes) {
   nodes.forEach((node) => { try { node.stop?.(); } catch {} try { node.disconnect?.(); } catch {} });
+}
+
+function previewDurationSeconds(type, repeats) {
+  const count = Math.max(1, Number(repeats) || 1);
+  if (type === "custom" && customBellBuffer) {
+    const spacing = Math.max(1.2, Math.min(customBellBuffer.duration + 0.2, 2));
+    return customBellBuffer.duration + (count - 1) * spacing;
+  }
+  const profile = BELL_PROFILES[type] || BELL_PROFILES.cuenco;
+  return profile.duration + (count - 1) * 1.45;
+}
+
+function stopBellPreview({ releaseRoute = true } = {}) {
+  if (previewStopHandle) window.clearTimeout(previewStopHandle);
+  previewStopHandle = null;
+  stopBellNodes(previewBellNodes);
+  previewBellNodes = [];
+  if (releaseRoute && !runtime) stopSessionAudio();
 }
 
 function clearScheduledBells() {
@@ -1511,6 +1550,9 @@ function ensureSessionAudioElement() {
   sessionAudio.loop = true;
   sessionAudio.preload = "auto";
   sessionAudio.playsInline = true;
+  sessionAudio.addEventListener("timeupdate", () => {
+    if (runtime?.status === "running") updateTimer();
+  });
   if ("mediaSession" in navigator) {
     try { navigator.mediaSession.setActionHandler("play", () => runtime?.status === "paused" && togglePause()); } catch {}
     try { navigator.mediaSession.setActionHandler("pause", () => runtime?.status === "running" && togglePause()); } catch {}
@@ -1548,24 +1590,17 @@ function stopSessionAudio() {
   }
 }
 
-function sessionRemainingSeconds() {
-  if (!runtime) return null;
-  const current = runtime.sequence[runtime.stepIndex];
-  if (!current?.durationSec) return null;
-  return Math.max(0, current.durationSec - currentPhaseElapsed())
-    + runtime.sequence.slice(runtime.stepIndex + 1).reduce((sum, phase) => sum + (phase.durationSec || 0), 0);
-}
-
 function phaseRemainingSeconds() {
   const phase = runtime?.sequence?.[runtime.stepIndex];
   return phase?.durationSec ? Math.max(0, phase.durationSec - currentPhaseElapsed()) : null;
 }
 
-function sessionEndText() {
-  const remaining = sessionRemainingSeconds();
-  if (remaining === null) return "Sesión abierta";
+function phaseEndText() {
+  const remaining = phaseRemainingSeconds();
+  if (remaining === null) return "Fase abierta";
+  if (runtime?.status === "paused") return `${formatClock(remaining)} pendientes en esta fase`;
   const end = new Date(Date.now() + remaining * 1000);
-  return `Termina a las ${end.toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" })}`;
+  return `La fase termina a las ${end.toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" })}`;
 }
 
 function updateMediaSession() {
@@ -1575,25 +1610,27 @@ function updateMediaSession() {
   navigator.mediaSession.metadata = new MediaMetadata({
     title: `${meta.label}${runtime.status === "paused" ? " · En pausa" : ""}`,
     artist: "Anhad · Meditación",
-    album: sessionEndText(),
+    album: phaseEndText(),
     artwork: [
       { src: new URL("./icon-192.png", location.href).href, sizes: "192x192", type: "image/png" },
       { src: new URL("./icon-512.png", location.href).href, sizes: "512x512", type: "image/png" }
     ]
   });
   navigator.mediaSession.playbackState = runtime.status === "paused" ? "paused" : "playing";
-  const duration = runtime.sequence.reduce((sum, item) => sum + (item.durationSec || 0), 0);
+  const duration = phase.durationSec || 0;
   if (duration > 0) {
     try {
-      navigator.mediaSession.setPositionState({ duration, playbackRate: 1, position: clamp(totalElapsed(), 0, duration) });
+      navigator.mediaSession.setPositionState({ duration, playbackRate: 1, position: clamp(currentPhaseElapsed(), 0, duration) });
     } catch {}
+  } else {
+    try { navigator.mediaSession.setPositionState(); } catch {}
   }
 }
 
 function sessionNotificationBody() {
   const phaseRemaining = phaseRemainingSeconds();
-  if (runtime?.status === "paused") return `En pausa · ${phaseRemaining === null ? "sesión abierta" : `${formatClock(phaseRemaining)} pendientes`}`;
-  return `${phaseRemaining === null ? "Cuenta adelante" : `${formatClock(phaseRemaining)} en esta fase`} · ${sessionEndText()}`;
+  if (runtime?.status === "paused") return `En pausa · ${phaseRemaining === null ? "fase abierta" : `${formatClock(phaseRemaining)} pendientes en esta fase`}`;
+  return `${phaseRemaining === null ? "Cuenta adelante" : `${formatClock(phaseRemaining)} restantes`} · ${phaseEndText()}`;
 }
 
 async function activeServiceWorkerRegistration() {
