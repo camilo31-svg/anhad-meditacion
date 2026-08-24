@@ -125,6 +125,12 @@ let storageWarningShown = false;
 let pwaRegistration = null;
 let offlineReady = false;
 let sessionAudio = null;
+let lockBellAudio = null;
+let lockBellObjectUrl = null;
+let lockBellPreparedFor = null;
+let lockBellPrimed = false;
+let lockBellRepeatsRemaining = 0;
+let lockBellSourceGeneration = 0;
 let scheduledBellNodes = [];
 let sessionBellsScheduled = false;
 let bellScheduleGeneration = 0;
@@ -522,6 +528,9 @@ async function startSession() {
   if (!sequence.length) return toast("Añade al menos un paso.", "warning");
   stopBellPreview({ releaseRoute: false });
   const backgroundPlayback = state.settings.sessionNotification ? startSessionAudio() : Promise.resolve(false);
+  const lockBellActivation = state.settings.sessionNotification
+    ? primeLockScreenBell({ playStartBell: state.settings.startBell, repeats: state.settings.bellRepeats })
+    : Promise.resolve({ primed: false, startPlayed: false });
   const audioReady = ensureAudio();
   const notificationPermission = state.settings.sessionNotification ? requestNotifications({ quiet: true }) : Promise.resolve(false);
   await audioReady.catch(() => null);
@@ -541,10 +550,13 @@ async function startSession() {
     mood: ""
   };
   saveRuntime();
+  const lockBellRoute = await lockBellActivation.catch(() => ({ primed: false, startPlayed: false }));
   await backgroundPlayback.catch(() => false);
+  if (state.settings.sessionNotification && lockBellRoute.primed && !lockBellRoute.startPlayed) await startSessionAudio();
   updateMediaSession();
-  if (state.settings.startBell) await playBell(state.settings.bell, state.settings.bellRepeats).catch(showAudioError);
-  scheduleSessionBells();
+  if (state.settings.startBell && !lockBellRoute.startPlayed) await playBell(state.settings.bell, state.settings.bellRepeats).catch(showAudioError);
+  if (lockBellRoute.primed) clearScheduledBells();
+  else scheduleSessionBells();
   if (await notificationPermission) updateSessionNotification();
   startAmbient();
   requestWakeLock();
@@ -585,7 +597,7 @@ function updateTimer() {
       runtime.stepIndex += 1;
       runtime.phaseStartedAt = boundary;
       runtime.lastInterval = 0;
-      if (!sessionBellsScheduled) playBell(state.settings.bell, 1).catch(showAudioError);
+      if (!sessionBellsScheduled) playSessionBell(1).catch(showAudioError);
       saveRuntime();
       phase = runtime.sequence[runtime.stepIndex];
       elapsed = currentPhaseElapsed();
@@ -596,7 +608,7 @@ function updateTimer() {
       const intervalIndex = Math.floor(elapsed / interval);
       if (intervalIndex > (runtime.lastInterval || 0)) {
         runtime.lastInterval = intervalIndex;
-        if (!sessionBellsScheduled) playBell(state.settings.bell, 1).catch(showAudioError);
+        if (!sessionBellsScheduled) playSessionBell(1).catch(showAudioError);
         saveRuntime();
       }
     }
@@ -604,6 +616,8 @@ function updateTimer() {
   if (phaseChanged) {
     updateMediaSession();
     updateSessionNotification();
+    render();
+    return;
   }
   updateTimerDom();
 }
@@ -686,9 +700,15 @@ function togglePause() {
     runtime.pausedAt = null;
     runtime.status = "running";
     startAmbient();
-    (state.settings.sessionNotification ? startSessionAudio() : Promise.resolve(false)).then(() => {
+    const audioPlayback = state.settings.sessionNotification ? startSessionAudio() : Promise.resolve(false);
+    const bellActivation = state.settings.sessionNotification
+      ? primeLockScreenBell({ playStartBell: false })
+      : Promise.resolve({ primed: false });
+    Promise.all([audioPlayback, bellActivation]).then(async ([, route]) => {
+      if (route.primed && !route.startPlayed) await startSessionAudio();
       updateMediaSession();
-      scheduleSessionBells();
+      if (route.primed) clearScheduledBells();
+      else scheduleSessionBells();
     });
   }
   saveRuntime();
@@ -722,10 +742,10 @@ function finishSession(natural = false, forcedEnd = Date.now()) {
   runtime.breakdown = calculateBreakdown(forcedEnd);
   runtime.natural = natural;
   saveRuntime();
+  if (state.settings.endBell && (!natural || !bellsWereScheduled)) playSessionBell(state.settings.bellRepeats).catch(showAudioError);
   stopAmbient();
   stopSessionAudio();
   releaseWakeLock();
-  if (state.settings.endBell && (!natural || !bellsWereScheduled)) playBell(state.settings.bell, state.settings.bellRepeats).catch(showAudioError);
   if (natural) showCompletedNotification();
   else closeSessionNotification();
   render();
@@ -1023,6 +1043,7 @@ function bindSettingsEvents() {
     const max = key === "volume" ? 1 : key === "weeklyGoal" ? 10080 : 1440;
     bindBoundedNumber(input, min, max, (value) => {
       state.settings[key] = value;
+      if (key === "volume" && lockBellAudio) lockBellAudio.volume = value;
     }, (value) => {
       if (key === "volume") document.querySelector("[data-volume-value]")?.replaceChildren(`${Math.round(value * 100)}%`);
       if (key === "weeklyGoal") {
@@ -1035,12 +1056,14 @@ function bindSettingsEvents() {
     const key = select.dataset.settingSelect;
     state.settings[key] = ["bellRepeats", "intervalMinutes"].includes(key) ? Number(select.value) : select.value;
     saveState();
+    if (key === "bell") prepareLockScreenBell().catch(() => {});
   }));
   document.querySelectorAll("[data-setting-toggle]").forEach((input) => input.addEventListener("change", async () => {
     const key = input.dataset.settingToggle;
     state.settings[key] = input.checked;
     saveState();
     if (key === "sessionNotification" && input.checked) await requestNotifications({ quiet: true });
+    if (key === "fadeIn") prepareLockScreenBell(state.settings.bell, { force: true }).catch(() => {});
   }));
   document.querySelectorAll("[data-direction]").forEach((button) => button.addEventListener("click", () => {
     state.settings.direction = button.dataset.direction;
@@ -1280,6 +1303,40 @@ const BELL_PROFILES = {
   cristal: { base: 523.25, partials: [1, 2, 3, 4.08], duration: 4.2 }
 };
 
+function synthesizedBellBlob(type) {
+  const profile = BELL_PROFILES[type] || BELL_PROFILES.cuenco;
+  const sampleRate = 12000;
+  const sampleCount = Math.ceil((profile.duration + 0.12) * sampleRate);
+  const buffer = new ArrayBuffer(44 + sampleCount * 2);
+  const view = new DataView(buffer);
+  const write = (offset, value) => [...value].forEach((character, index) => view.setUint8(offset + index, character.charCodeAt(0)));
+  write(0, "RIFF");
+  view.setUint32(4, 36 + sampleCount * 2, true);
+  write(8, "WAVE");
+  write(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  write(36, "data");
+  view.setUint32(40, sampleCount * 2, true);
+
+  const attackSeconds = state.settings.fadeIn ? 0.075 : 0.008;
+  for (let index = 0; index < sampleCount; index += 1) {
+    const time = index / sampleRate;
+    const attack = Math.min(1, time / attackSeconds);
+    const decay = Math.exp(-5.1 * time / profile.duration);
+    const tone = profile.partials.reduce((sum, partial, partialIndex) =>
+      sum + Math.sin(2 * Math.PI * profile.base * partial * time) / (partialIndex + 1), 0) / 1.85;
+    const sample = clamp(tone * attack * decay * 0.88, -1, 1);
+    view.setInt16(44 + index * 2, Math.round(sample * 32767), true);
+  }
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
 function showAudioError(error) {
   console.warn("Anhad no pudo reproducir la campana.", error);
   if (audioWarningShown) return;
@@ -1382,6 +1439,18 @@ async function playBell(type = "cuenco", repeats = 1, { nodes = null } = {}) {
   audioWarningShown = false;
   if (state.settings.vibration) navigator.vibrate?.(160);
   return true;
+}
+
+async function playSessionBell(repeats = 1) {
+  if (state.settings.sessionNotification && lockBellPrimed) {
+    try {
+      return await playLockScreenBell(repeats);
+    } catch (error) {
+      lockBellPrimed = false;
+      console.warn("La campana multimedia falló; se usará el reproductor alternativo.", error);
+    }
+  }
+  return playBell(state.settings.bell, repeats);
 }
 
 async function testBell(event) {
@@ -1542,6 +1611,124 @@ function silentWavUrl(seconds = 8, sampleRate = 8000) {
   let binary = "";
   for (let offset = 0; offset < bytes.length; offset += 8192) binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
   return `data:audio/wav;base64,${btoa(binary)}`;
+}
+
+function ensureLockBellAudioElement() {
+  if (lockBellAudio) return lockBellAudio;
+  lockBellAudio = new Audio();
+  lockBellAudio.preload = "auto";
+  lockBellAudio.playsInline = true;
+  lockBellAudio.addEventListener("ended", () => {
+    if (lockBellRepeatsRemaining > 0) {
+      lockBellRepeatsRemaining -= 1;
+      lockBellAudio.currentTime = 0;
+      lockBellAudio.play().catch((error) => {
+        lockBellPrimed = false;
+        showAudioError(error);
+      });
+      return;
+    }
+    if (runtime?.status === "running" && state.settings.sessionNotification) {
+      startSessionAudio().then(() => updateMediaSession());
+    }
+  });
+  return lockBellAudio;
+}
+
+function releaseLockBellObjectUrl() {
+  if (lockBellObjectUrl) URL.revokeObjectURL(lockBellObjectUrl);
+  lockBellObjectUrl = null;
+}
+
+function installLockBellBlob(blob, type) {
+  const audio = ensureLockBellAudioElement();
+  audio.pause();
+  releaseLockBellObjectUrl();
+  lockBellObjectUrl = URL.createObjectURL(blob);
+  audio.src = lockBellObjectUrl;
+  audio.volume = state.settings.volume;
+  audio.load();
+  lockBellPreparedFor = type;
+}
+
+async function prepareLockScreenBell(type = state.settings.bell, { force = false } = {}) {
+  const audio = ensureLockBellAudioElement();
+  if (type === "silencio") {
+    audio.pause();
+    lockBellPreparedFor = "silencio";
+    return false;
+  }
+  if (!force && lockBellPreparedFor === type && audio.src) return true;
+  const generation = ++lockBellSourceGeneration;
+  const blob = type === "custom" ? await customBellBlob() : synthesizedBellBlob(type);
+  if (generation !== lockBellSourceGeneration) return false;
+  if (!blob) throw new Error("No se encontró el sonido elegido para la pantalla bloqueada.");
+  installLockBellBlob(blob, type);
+  return true;
+}
+
+async function primeLockScreenBell({ playStartBell = false, repeats = 1 } = {}) {
+  const type = state.settings.bell;
+  if (type === "silencio") return { primed: false, startPlayed: false };
+  const audio = ensureLockBellAudioElement();
+  const sourceReady = lockBellPreparedFor === type && Boolean(audio.src);
+  if (lockBellPrimed && sourceReady && !playStartBell) return { primed: true, startPlayed: false };
+
+  if (!sourceReady) {
+    audio.pause();
+    releaseLockBellObjectUrl();
+    audio.src = silentWavUrl(0.25);
+    audio.load();
+    lockBellPreparedFor = null;
+  }
+
+  audio.volume = sourceReady && playStartBell ? state.settings.volume : 0;
+  lockBellRepeatsRemaining = sourceReady && playStartBell ? Math.max(0, Number(repeats) - 1) : 0;
+  try {
+    // This play call intentionally happens before the first await so the
+    // element remains authorized after the phone locks its screen.
+    const playback = audio.play();
+    await playback;
+    lockBellPrimed = true;
+  } catch (error) {
+    lockBellPrimed = false;
+    console.warn("No se pudo preparar la campana para la pantalla bloqueada.", error);
+    prepareLockScreenBell(type).catch(() => {});
+    return { primed: false, startPlayed: false };
+  }
+
+  if (sourceReady && playStartBell) {
+    updateMediaSession();
+    return { primed: true, startPlayed: true };
+  }
+
+  audio.pause();
+  audio.currentTime = 0;
+  audio.volume = state.settings.volume;
+  const prepared = sourceReady || await prepareLockScreenBell(type).catch(() => false);
+  if (prepared && playStartBell) {
+    await playLockScreenBell(repeats);
+    return { primed: true, startPlayed: true };
+  }
+  return { primed: true, startPlayed: false };
+}
+
+async function playLockScreenBell(repeats = 1) {
+  if (state.settings.bell === "silencio") {
+    if (state.settings.vibration) navigator.vibrate?.([180, 80, 180]);
+    return true;
+  }
+  if (lockBellPreparedFor !== state.settings.bell || !lockBellAudio?.src) await prepareLockScreenBell();
+  const audio = ensureLockBellAudioElement();
+  audio.pause();
+  audio.currentTime = 0;
+  audio.volume = state.settings.volume;
+  lockBellRepeatsRemaining = Math.max(0, Number(repeats) - 1);
+  await audio.play();
+  audioWarningShown = false;
+  if (runtime?.status === "running") updateMediaSession();
+  if (state.settings.vibration) navigator.vibrate?.(160);
+  return true;
 }
 
 function ensureSessionAudioElement() {
@@ -1791,6 +1978,7 @@ async function loadCustomBell(event) {
       throw new Error("No hay espacio suficiente para guardar este sonido.");
     }
     customBellBuffer = decoded;
+    await prepareLockScreenBell("custom", { force: true }).catch((error) => console.warn("No se pudo preparar el sonido propio para la pantalla bloqueada.", error));
     toast("Sonido propio guardado en este dispositivo.", "success");
     render();
   } catch (error) { toast(error.message, "warning"); }
@@ -1875,7 +2063,7 @@ document.addEventListener("visibilitychange", () => {
       requestWakeLock();
       updateTimer();
       if (state.settings.sessionNotification) startSessionAudio().then(() => updateMediaSession());
-      if (!sessionBellsScheduled) scheduleSessionBells();
+      if (!sessionBellsScheduled && !lockBellPrimed) scheduleSessionBells();
       updateSessionNotification();
     }
   }
@@ -1892,6 +2080,7 @@ render = function renderWithModalBindings() {
 };
 
 setTheme();
+prepareLockScreenBell().catch(() => {});
 registerPwa();
 restoreRuntime();
 render();
