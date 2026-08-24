@@ -62,11 +62,13 @@ const defaultState = {
     intervalMinutes: 0,
     fadeIn: true,
     vibration: true,
+    sessionNotification: true,
     ambient: "none",
     quotes: true,
     tree: "Olivo",
     background: "ivory",
     customBell: null,
+    customBellName: "",
     customBackground: null
   },
   currentProfileId: "profile-main",
@@ -120,6 +122,14 @@ let installPrompt = null;
 let audioContext = null;
 let ambientNodes = [];
 let storageWarningShown = false;
+let pwaRegistration = null;
+let offlineReady = false;
+let sessionAudio = null;
+let scheduledBellNodes = [];
+let sessionBellsScheduled = false;
+let bellScheduleGeneration = 0;
+let customBellBuffer = null;
+let audioWarningShown = false;
 
 const ui = {
   view: runtime ? "meditar" : "meditar",
@@ -185,6 +195,17 @@ function toast(message, tone = "default") {
     element.classList.remove("show");
     setTimeout(() => element.remove(), 280);
   }, 3200);
+}
+
+function offlineStatusText() {
+  if (offlineReady) return navigator.onLine ? "Lista para usar offline" : "Funcionando sin conexión";
+  return navigator.onLine ? "Preparando modo offline…" : "Modo offline no preparado";
+}
+
+function updateOfflineIndicators() {
+  document.querySelectorAll("[data-offline-status]").forEach((element) => {
+    element.textContent = offlineStatusText();
+  });
 }
 
 function todaySeconds() {
@@ -301,7 +322,7 @@ function renderMeditate() {
     <section class="hero" aria-labelledby="timer-title">
       <div class="hero-kicker-row">
         <p class="eyebrow">${greeting.toUpperCase()} · ${escapeHtml(profile.name.toUpperCase())}</p>
-        <span class="offline-chip"><i></i> Privado y offline</span>
+        <span class="offline-chip"><i></i><span data-offline-status>${offlineStatusText()}</span></span>
       </div>
       <h1 id="timer-title">Tiempo para volver<br />a tu centro.</h1>
 
@@ -497,7 +518,10 @@ function sequenceForCurrentMode() {
 async function startSession() {
   const sequence = sequenceForCurrentMode();
   if (!sequence.length) return toast("Añade al menos un paso.", "warning");
-  await ensureAudio().catch(() => null);
+  const backgroundPlayback = state.settings.sessionNotification ? startSessionAudio() : Promise.resolve(false);
+  const audioReady = ensureAudio();
+  const notificationPermission = state.settings.sessionNotification ? requestNotifications({ quiet: true }) : Promise.resolve(false);
+  await audioReady.catch(() => null);
   const now = Date.now();
   runtime = {
     id: uid("session"),
@@ -514,7 +538,11 @@ async function startSession() {
     mood: ""
   };
   saveRuntime();
-  if (state.settings.startBell) playBell(state.settings.bell, state.settings.bellRepeats);
+  await backgroundPlayback.catch(() => false);
+  updateMediaSession();
+  if (state.settings.startBell) await playBell(state.settings.bell, state.settings.bellRepeats).catch(showAudioError);
+  scheduleSessionBells();
+  if (await notificationPermission) updateSessionNotification();
   startAmbient();
   requestWakeLock();
   render();
@@ -542,6 +570,7 @@ function totalElapsed(now = Date.now()) {
 function updateTimer() {
   if (!runtime || runtime.status !== "running") return updateTimerDom();
   let phase = runtime.sequence[runtime.stepIndex];
+  let phaseChanged = false;
   if (phase?.durationSec) {
     let elapsed = currentPhaseElapsed();
     while (phase && phase.durationSec && elapsed >= phase.durationSec && runtime?.status === "running") {
@@ -553,20 +582,25 @@ function updateTimer() {
       runtime.stepIndex += 1;
       runtime.phaseStartedAt = boundary;
       runtime.lastInterval = 0;
-      playBell(state.settings.bell, 1);
+      if (!sessionBellsScheduled) playBell(state.settings.bell, 1).catch(showAudioError);
       saveRuntime();
       phase = runtime.sequence[runtime.stepIndex];
       elapsed = currentPhaseElapsed();
+      phaseChanged = true;
     }
     const interval = Number(state.settings.intervalMinutes) * 60;
     if (interval > 0 && elapsed >= interval) {
       const intervalIndex = Math.floor(elapsed / interval);
       if (intervalIndex > (runtime.lastInterval || 0)) {
         runtime.lastInterval = intervalIndex;
-        playBell(state.settings.bell, 1);
+        if (!sessionBellsScheduled) playBell(state.settings.bell, 1).catch(showAudioError);
         saveRuntime();
       }
     }
+  }
+  if (phaseChanged) {
+    updateMediaSession();
+    updateSessionNotification();
   }
   updateTimerDom();
 }
@@ -637,9 +671,11 @@ function updateTimerDom() {
 
 function togglePause() {
   if (runtime.status === "running") {
+    clearScheduledBells();
     runtime.status = "paused";
     runtime.pausedAt = Date.now();
     stopAmbient();
+    pauseSessionAudio();
   } else {
     const pauseDuration = Date.now() - runtime.pausedAt;
     runtime.pausedTotalMs += pauseDuration;
@@ -647,8 +683,14 @@ function togglePause() {
     runtime.pausedAt = null;
     runtime.status = "running";
     startAmbient();
+    (state.settings.sessionNotification ? startSessionAudio() : Promise.resolve(false)).then(() => {
+      updateMediaSession();
+      scheduleSessionBells();
+    });
   }
   saveRuntime();
+  updateMediaSession();
+  updateSessionNotification();
   render();
 }
 
@@ -666,6 +708,8 @@ function calculateBreakdown(atTime) {
 
 function finishSession(natural = false, forcedEnd = Date.now()) {
   if (!runtime || runtime.status === "complete") return;
+  const bellsWereScheduled = sessionBellsScheduled;
+  clearScheduledBells();
   if (runtime.status === "paused") forcedEnd = runtime.pausedAt;
   clearInterval(timerHandle);
   const durationSec = Math.max(1, Math.floor((forcedEnd - runtime.startedAt - (runtime.pausedTotalMs || 0)) / 1000));
@@ -676,8 +720,11 @@ function finishSession(natural = false, forcedEnd = Date.now()) {
   runtime.natural = natural;
   saveRuntime();
   stopAmbient();
+  stopSessionAudio();
   releaseWakeLock();
-  if (state.settings.endBell) playBell(state.settings.bell, state.settings.bellRepeats);
+  if (state.settings.endBell && (!natural || !bellsWereScheduled)) playBell(state.settings.bell, state.settings.bellRepeats).catch(showAudioError);
+  if (natural) showCompletedNotification();
+  else closeSessionNotification();
   render();
 }
 
@@ -715,6 +762,7 @@ function renderCompletion() {
   document.querySelector('[data-action="save-session"]')?.addEventListener("click", saveCompletedSession);
   document.querySelector('[data-action="discard-session"]')?.addEventListener("click", () => {
     if (!confirm("¿Descartar esta sesión sin guardarla?")) return;
+    closeSessionNotification();
     runtime = null;
     saveRuntime();
     ui.view = "meditar";
@@ -739,6 +787,7 @@ function saveCompletedSession() {
   });
   state.sessions.sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt));
   saveState();
+  closeSessionNotification();
   runtime = null;
   saveRuntime();
   ui.view = "calendario";
@@ -924,12 +973,13 @@ function renderSettings() {
       <div class="field-grid"><label>Campana<select data-setting-select="bell">${[["cuenco", "Cuenco tibetano"], ["tibetana", "Campana tibetana"], ["gong", "Gong grave"], ["cristal", "Cuenco de cristal"], ["silencio", "Silencio + vibración"], ["custom", "Sonido propio"]].map(([value, label]) => `<option value="${value}" ${state.settings.bell === value ? "selected" : ""}>${label}</option>`).join("")}</select></label><label>Ambiente<select data-setting-select="ambient">${[["none", "Ninguno"], ["rain", "Lluvia"], ["forest", "Bosque"], ["ocean", "Océano"], ["wind", "Viento"], ["fireplace", "Chimenea"], ["birds", "Aves"]].map(([value, label]) => `<option value="${value}" ${state.settings.ambient === value ? "selected" : ""}>${label}</option>`).join("")}</select></label></div>
       <label class="range-field">Volumen <input type="range" min="0" max="1" step="0.05" value="${state.settings.volume}" data-setting-number="volume" /><b data-volume-value>${Math.round(state.settings.volume * 100)}%</b></label>
       <div class="field-grid"><label>Repeticiones<select data-setting-select="bellRepeats">${[1,2,3].map((value) => `<option value="${value}" ${Number(state.settings.bellRepeats) === value ? "selected" : ""}>${value} ${value === 1 ? "toque" : "toques"}</option>`).join("")}</select></label><label>Intervalo adicional<select data-setting-select="intervalMinutes">${[[0, "Sin intervalo"], [5, "Cada 5 min"], [10, "Cada 10 min"], [15, "Cada 15 min"], [30, "Cada 30 min"]].map(([value, label]) => `<option value="${value}" ${Number(state.settings.intervalMinutes) === value ? "selected" : ""}>${label}</option>`).join("")}</select></label></div>
-      <div class="button-row"><button class="secondary-button" type="button" data-action="test-bell">Probar campana</button><label class="file-button">Cargar sonido<input type="file" accept="audio/*" data-file="bell" /></label></div>
+      <div class="button-row"><button class="secondary-button" type="button" data-action="test-bell">Probar campana</button><label class="file-button">Cargar sonido<input type="file" accept="audio/*,.mp3,.m4a,.wav,.aac,.ogg,.oga,.flac" data-file="bell" /></label></div>
+      <p class="file-hint">${state.settings.customBellName ? `Sonido propio: ${escapeHtml(state.settings.customBellName)}` : "Formatos: MP3, M4A, WAV, AAC, OGG o FLAC · máximo 12 MB"}</p>
       ${toggleRow("Campana de inicio", "startBell", state.settings.startBell)}${toggleRow("Campana final", "endBell", state.settings.endBell)}${toggleRow("Entrada gradual", "fadeIn", state.settings.fadeIn)}${toggleRow("Vibración", "vibration", state.settings.vibration)}
     </section>
     <section class="settings-section"><div class="settings-heading"><span>◷</span><div><h2>Temporizador</h2><p>Elige cómo ver tu práctica</p></div></div>
       <div class="segmented-control"><button type="button" class="${state.settings.direction === "countdown" ? "active" : ""}" data-direction="countdown">Cuenta atrás</button><button type="button" class="${state.settings.direction === "countup" ? "active" : ""}" data-direction="countup">Cuenta adelante</button></div>
-      ${toggleRow("Modo silencioso: ocultar reloj", "hideClock", state.settings.hideClock)}${toggleRow("Frase al terminar", "quotes", state.settings.quotes)}
+      ${toggleRow("Modo silencioso: ocultar reloj", "hideClock", state.settings.hideClock)}${toggleRow("Temporizador en pantalla bloqueada", "sessionNotification", state.settings.sessionNotification, "Muestra la fase y la hora de finalización")}${toggleRow("Frase al terminar", "quotes", state.settings.quotes)}
     </section>
     <section class="settings-section"><div class="settings-heading"><span>♣</span><div><h2>Motivación</h2><p>Árbol de constancia y logros</p></div></div>
       <label>Especie de árbol<select data-setting-select="tree">${["Olivo", "Roble", "Cerezo", "Manglar", "Arce", "Glicinia"].map((tree) => `<option ${state.settings.tree === tree ? "selected" : ""}>${tree}</option>`).join("")}</select></label>
@@ -945,6 +995,7 @@ function renderSettings() {
       ${state.presets.length ? `<div class="preset-list">${state.presets.filter((preset) => preset.profileId === state.currentProfileId).map((preset) => `<div><span><strong>${escapeHtml(preset.name)}</strong><small>${preset.steps.length} pasos · ${preset.rounds} rondas</small></span><button type="button" data-load-preset="${preset.id}">Usar</button><button type="button" data-delete-preset="${preset.id}" aria-label="Eliminar rutina">×</button></div>`).join("")}</div>` : ""}
     </section>
     <section class="settings-section"><div class="settings-heading"><span>⇄</span><div><h2>Tus datos</h2><p>Solo se guardan en este dispositivo</p></div></div>
+      <div class="notification-note"><span>✓</span><p data-offline-status>${offlineStatusText()}</p></div>
       <div class="button-grid"><button class="secondary-button" type="button" data-export="json">Exportar JSON</button><button class="secondary-button" type="button" data-export="csv">Exportar CSV</button><label class="file-button">Importar copia<input type="file" accept="application/json" data-file="import" /></label>${installPrompt ? '<button class="secondary-button" type="button" data-action="install">Instalar app</button>' : ""}</div>
     </section>
     <p class="privacy-footer">Sin cuenta · Sin anuncios · Sin seguimiento · Funciona offline</p>
@@ -953,8 +1004,8 @@ function renderSettings() {
   bindSettingsEvents();
 }
 
-function toggleRow(label, key, checked) {
-  return `<label class="switch-row"><span><strong>${label}</strong></span><input type="checkbox" data-setting-toggle="${key}" ${checked ? "checked" : ""} /><i></i></label>`;
+function toggleRow(label, key, checked, description = "") {
+  return `<label class="switch-row"><span><strong>${label}</strong>${description ? `<small>${description}</small>` : ""}</span><input type="checkbox" data-setting-toggle="${key}" ${checked ? "checked" : ""} /><i></i></label>`;
 }
 
 function reminderRow(reminder) {
@@ -982,9 +1033,11 @@ function bindSettingsEvents() {
     state.settings[key] = ["bellRepeats", "intervalMinutes"].includes(key) ? Number(select.value) : select.value;
     saveState();
   }));
-  document.querySelectorAll("[data-setting-toggle]").forEach((input) => input.addEventListener("change", () => {
-    state.settings[input.dataset.settingToggle] = input.checked;
+  document.querySelectorAll("[data-setting-toggle]").forEach((input) => input.addEventListener("change", async () => {
+    const key = input.dataset.settingToggle;
+    state.settings[key] = input.checked;
     saveState();
+    if (key === "sessionNotification" && input.checked) await requestNotifications({ quiet: true });
   }));
   document.querySelectorAll("[data-direction]").forEach((button) => button.addEventListener("click", () => {
     state.settings.direction = button.dataset.direction;
@@ -1003,7 +1056,7 @@ function bindSettingsEvents() {
     document.querySelectorAll("[data-background]").forEach((item) => item.classList.toggle("selected", item === button));
     setTheme();
   }));
-  document.querySelector('[data-action="test-bell"]')?.addEventListener("click", () => playBell(state.settings.bell, state.settings.bellRepeats));
+  document.querySelector('[data-action="test-bell"]')?.addEventListener("click", testBell);
   document.querySelector('[data-action="notifications"]')?.addEventListener("click", requestNotifications);
   document.querySelector('[data-action="add-reminder"]')?.addEventListener("click", () => { ui.modal = "reminder"; ui.detailId = null; render(); });
   document.querySelectorAll("[data-edit-reminder]").forEach((button) => button.addEventListener("click", () => { ui.modal = "reminder"; ui.detailId = button.dataset.editReminder; render(); }));
@@ -1209,51 +1262,192 @@ function deleteCurrentProfile() {
 }
 
 async function ensureAudio() {
-  if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) throw new Error("Este navegador no admite reproducción de audio.");
+  if (!audioContext || audioContext.state === "closed") audioContext = new AudioContextClass({ latencyHint: "interactive" });
   if (audioContext.state === "suspended") await audioContext.resume();
+  if (audioContext.state !== "running") throw new Error("El móvil ha bloqueado el audio. Toca de nuevo para activarlo.");
   return audioContext;
 }
 
-async function playBell(type = "cuenco", repeats = 1) {
-  if (type === "silencio") {
-    if (state.settings.vibration) navigator.vibrate?.([180, 80, 180]);
-    return;
-  }
-  if (type === "custom" && state.settings.customBell) {
-    for (let index = 0; index < repeats; index += 1) {
-      const audio = new Audio(state.settings.customBell);
-      audio.volume = state.settings.volume;
-      setTimeout(() => audio.play().catch(() => {}), index * 1500);
-    }
-    return;
-  }
-  const context = await ensureAudio().catch(() => null);
-  if (!context) return;
-  const profiles = {
-    cuenco: { base: 220, partials: [1, 2.01, 3.12, 4.17], duration: 4.6 },
-    tibetana: { base: 330, partials: [1, 1.5, 2.01, 2.74], duration: 3.8 },
-    gong: { base: 110, partials: [1, 1.41, 2.18, 2.97], duration: 5.6 },
-    cristal: { base: 523.25, partials: [1, 2, 3, 4.08], duration: 4.2 }
-  };
-  const profile = profiles[type] || profiles.cuenco;
+const BELL_PROFILES = {
+  cuenco: { base: 220, partials: [1, 2.01, 3.12, 4.17], duration: 4.6 },
+  tibetana: { base: 330, partials: [1, 1.5, 2.01, 2.74], duration: 3.8 },
+  gong: { base: 110, partials: [1, 1.41, 2.18, 2.97], duration: 5.6 },
+  cristal: { base: 523.25, partials: [1, 2, 3, 4.08], duration: 4.2 }
+};
+
+function showAudioError(error) {
+  console.warn("Anhad no pudo reproducir la campana.", error);
+  if (audioWarningShown) return;
+  audioWarningShown = true;
+  toast(error?.message || "No se pudo reproducir el sonido. Revisa el volumen multimedia del móvil.", "warning");
+}
+
+function scheduleSynthBell(context, type, repeats, startAt, nodes = null) {
+  const profile = BELL_PROFILES[type] || BELL_PROFILES.cuenco;
   for (let ring = 0; ring < repeats; ring += 1) {
-    const start = context.currentTime + ring * 1.45;
+    const start = startAt + ring * 1.45;
     profile.partials.forEach((partial, index) => {
       const oscillator = context.createOscillator();
       const gain = context.createGain();
       oscillator.type = index === 0 ? "sine" : "triangle";
       oscillator.frequency.setValueAtTime(profile.base * partial, start);
       oscillator.detune.setValueAtTime((index - 1) * 2.5, start);
-      const peak = state.settings.volume * (0.34 / (index + 1));
+      const peak = state.settings.volume * (0.46 / (index + 1));
       gain.gain.setValueAtTime(0.0001, start);
       gain.gain.exponentialRampToValueAtTime(Math.max(0.0001, peak), start + (state.settings.fadeIn ? 0.08 : 0.012));
       gain.gain.exponentialRampToValueAtTime(0.0001, start + profile.duration);
       oscillator.connect(gain).connect(context.destination);
       oscillator.start(start);
       oscillator.stop(start + profile.duration + 0.1);
+      if (nodes) nodes.push(oscillator, gain);
     });
   }
+}
+
+function openMediaDatabase() {
+  return new Promise((resolve, reject) => {
+    if (!("indexedDB" in window)) return reject(new Error("Este navegador no permite guardar audio offline."));
+    const request = indexedDB.open("anhad-media", 1);
+    request.onupgradeneeded = () => request.result.createObjectStore("files");
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("No se pudo abrir el almacenamiento de audio."));
+  });
+}
+
+async function mediaDatabaseGet(key) {
+  const database = await openMediaDatabase();
+  return new Promise((resolve, reject) => {
+    const request = database.transaction("files", "readonly").objectStore("files").get(key);
+    request.onsuccess = () => { database.close(); resolve(request.result || null); };
+    request.onerror = () => { database.close(); reject(request.error); };
+  });
+}
+
+async function mediaDatabasePut(key, value) {
+  const database = await openMediaDatabase();
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction("files", "readwrite");
+    transaction.objectStore("files").put(value, key);
+    transaction.oncomplete = () => { database.close(); resolve(true); };
+    transaction.onerror = () => { database.close(); reject(transaction.error); };
+  });
+}
+
+async function customBellBlob() {
+  const stored = await mediaDatabaseGet("custom-bell").catch(() => null);
+  if (stored instanceof Blob) return stored;
+  if (state.settings.customBell) return fetch(state.settings.customBell).then((response) => response.blob());
+  return null;
+}
+
+async function customBellAudioBuffer(context) {
+  if (customBellBuffer) return customBellBuffer;
+  const blob = await customBellBlob();
+  if (!blob) throw new Error("Carga primero un archivo de audio para usar el sonido propio.");
+  customBellBuffer = await context.decodeAudioData(await blob.arrayBuffer());
+  return customBellBuffer;
+}
+
+async function scheduleBellAt(type, repeats, startAt, { nodes = null } = {}) {
+  const context = await ensureAudio();
+  if (type === "custom") {
+    const buffer = await customBellAudioBuffer(context);
+    for (let ring = 0; ring < repeats; ring += 1) {
+      const source = context.createBufferSource();
+      const gain = context.createGain();
+      source.buffer = buffer;
+      gain.gain.value = state.settings.volume;
+      source.connect(gain).connect(context.destination);
+      source.start(startAt + ring * Math.max(1.2, Math.min(buffer.duration + 0.2, 2)));
+      if (nodes) nodes.push(source, gain);
+    }
+    return true;
+  }
+  scheduleSynthBell(context, type, repeats, startAt, nodes);
+  return true;
+}
+
+async function playBell(type = "cuenco", repeats = 1) {
+  if (type === "silencio") {
+    if (state.settings.vibration) navigator.vibrate?.([180, 80, 180]);
+    return true;
+  }
+  const context = await ensureAudio();
+  await scheduleBellAt(type, repeats, context.currentTime + 0.035);
+  audioWarningShown = false;
   if (state.settings.vibration) navigator.vibrate?.(160);
+  return true;
+}
+
+async function testBell(event) {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    await ensureAudio();
+    await playBell(state.settings.bell, state.settings.bellRepeats);
+    toast("Sonido de prueba reproducido.", "success");
+  } catch (error) {
+    showAudioError(error);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function stopBellNodes(nodes) {
+  nodes.forEach((node) => { try { node.stop?.(); } catch {} try { node.disconnect?.(); } catch {} });
+}
+
+function clearScheduledBells() {
+  bellScheduleGeneration += 1;
+  stopBellNodes(scheduledBellNodes);
+  scheduledBellNodes = [];
+  sessionBellsScheduled = false;
+}
+
+async function scheduleSessionBells() {
+  clearScheduledBells();
+  if (!runtime || runtime.status !== "running" || state.settings.bell === "silencio") return;
+  const generation = bellScheduleGeneration;
+  const nodes = [];
+  try {
+    const context = await ensureAudio();
+    const now = Date.now();
+    const intervalSec = Number(state.settings.intervalMinutes) * 60;
+    let phaseStartMs = runtime.phaseStartedAt;
+    let scheduledAny = false;
+    for (let index = runtime.stepIndex; index < runtime.sequence.length; index += 1) {
+      const phase = runtime.sequence[index];
+      if (!phase.durationSec) break;
+      const phaseEndMs = phaseStartMs + phase.durationSec * 1000;
+      if (intervalSec > 0) {
+        for (let atMs = phaseStartMs + intervalSec * 1000; atMs < phaseEndMs; atMs += intervalSec * 1000) {
+          if (atMs <= now) continue;
+          await scheduleBellAt(state.settings.bell, 1, context.currentTime + (atMs - now) / 1000, { nodes });
+          scheduledAny = true;
+        }
+      }
+      const isFinal = index === runtime.sequence.length - 1;
+      if (phaseEndMs > now && (!isFinal || state.settings.endBell)) {
+        await scheduleBellAt(state.settings.bell, isFinal ? state.settings.bellRepeats : 1, context.currentTime + (phaseEndMs - now) / 1000, { nodes });
+        scheduledAny = true;
+      }
+      phaseStartMs = phaseEndMs;
+    }
+    if (generation !== bellScheduleGeneration) {
+      stopBellNodes(nodes);
+      return;
+    }
+    scheduledBellNodes.push(...nodes);
+    sessionBellsScheduled = scheduledAny;
+  } catch (error) {
+    stopBellNodes(nodes);
+    if (generation === bellScheduleGeneration) {
+      sessionBellsScheduled = false;
+      showAudioError(error);
+    }
+  }
 }
 
 async function startAmbient() {
@@ -1286,6 +1480,168 @@ function stopAmbient() {
   ambientNodes = [];
 }
 
+function silentWavUrl(seconds = 8, sampleRate = 8000) {
+  const sampleCount = seconds * sampleRate;
+  const buffer = new ArrayBuffer(44 + sampleCount);
+  const view = new DataView(buffer);
+  const write = (offset, value) => [...value].forEach((character, index) => view.setUint8(offset + index, character.charCodeAt(0)));
+  write(0, "RIFF");
+  view.setUint32(4, 36 + sampleCount, true);
+  write(8, "WAVE");
+  write(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate, true);
+  view.setUint16(32, 1, true);
+  view.setUint16(34, 8, true);
+  write(36, "data");
+  view.setUint32(40, sampleCount, true);
+  new Uint8Array(buffer, 44).fill(128);
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 8192) binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+  return `data:audio/wav;base64,${btoa(binary)}`;
+}
+
+function ensureSessionAudioElement() {
+  if (sessionAudio) return sessionAudio;
+  sessionAudio = new Audio(silentWavUrl());
+  sessionAudio.loop = true;
+  sessionAudio.preload = "auto";
+  sessionAudio.playsInline = true;
+  if ("mediaSession" in navigator) {
+    try { navigator.mediaSession.setActionHandler("play", () => runtime?.status === "paused" && togglePause()); } catch {}
+    try { navigator.mediaSession.setActionHandler("pause", () => runtime?.status === "running" && togglePause()); } catch {}
+    try { navigator.mediaSession.setActionHandler("stop", () => runtime && finishSession(false)); } catch {}
+  }
+  return sessionAudio;
+}
+
+async function startSessionAudio() {
+  try {
+    const audio = ensureSessionAudioElement();
+    await audio.play();
+    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
+    return true;
+  } catch (error) {
+    console.warn("No se pudo mantener activa la sesión de audio.", error);
+    return false;
+  }
+}
+
+function pauseSessionAudio() {
+  sessionAudio?.pause();
+  if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+}
+
+function stopSessionAudio() {
+  if (sessionAudio) {
+    sessionAudio.pause();
+    sessionAudio.currentTime = 0;
+  }
+  if ("mediaSession" in navigator) {
+    navigator.mediaSession.playbackState = "none";
+    navigator.mediaSession.metadata = null;
+    try { navigator.mediaSession.setPositionState(); } catch {}
+  }
+}
+
+function sessionRemainingSeconds() {
+  if (!runtime) return null;
+  const current = runtime.sequence[runtime.stepIndex];
+  if (!current?.durationSec) return null;
+  return Math.max(0, current.durationSec - currentPhaseElapsed())
+    + runtime.sequence.slice(runtime.stepIndex + 1).reduce((sum, phase) => sum + (phase.durationSec || 0), 0);
+}
+
+function phaseRemainingSeconds() {
+  const phase = runtime?.sequence?.[runtime.stepIndex];
+  return phase?.durationSec ? Math.max(0, phase.durationSec - currentPhaseElapsed()) : null;
+}
+
+function sessionEndText() {
+  const remaining = sessionRemainingSeconds();
+  if (remaining === null) return "Sesión abierta";
+  const end = new Date(Date.now() + remaining * 1000);
+  return `Termina a las ${end.toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" })}`;
+}
+
+function updateMediaSession() {
+  if (!("mediaSession" in navigator) || !("MediaMetadata" in window) || !runtime || !["running", "paused"].includes(runtime.status)) return;
+  const phase = runtime.sequence[runtime.stepIndex];
+  const meta = CATEGORY_META[phase.category];
+  navigator.mediaSession.metadata = new MediaMetadata({
+    title: `${meta.label}${runtime.status === "paused" ? " · En pausa" : ""}`,
+    artist: "Anhad · Meditación",
+    album: sessionEndText(),
+    artwork: [
+      { src: new URL("./icon-192.png", location.href).href, sizes: "192x192", type: "image/png" },
+      { src: new URL("./icon-512.png", location.href).href, sizes: "512x512", type: "image/png" }
+    ]
+  });
+  navigator.mediaSession.playbackState = runtime.status === "paused" ? "paused" : "playing";
+  const duration = runtime.sequence.reduce((sum, item) => sum + (item.durationSec || 0), 0);
+  if (duration > 0) {
+    try {
+      navigator.mediaSession.setPositionState({ duration, playbackRate: 1, position: clamp(totalElapsed(), 0, duration) });
+    } catch {}
+  }
+}
+
+function sessionNotificationBody() {
+  const phaseRemaining = phaseRemainingSeconds();
+  if (runtime?.status === "paused") return `En pausa · ${phaseRemaining === null ? "sesión abierta" : `${formatClock(phaseRemaining)} pendientes`}`;
+  return `${phaseRemaining === null ? "Cuenta adelante" : `${formatClock(phaseRemaining)} en esta fase`} · ${sessionEndText()}`;
+}
+
+async function activeServiceWorkerRegistration() {
+  if (pwaRegistration?.active) return pwaRegistration;
+  return navigator.serviceWorker?.ready.catch(() => null);
+}
+
+async function updateSessionNotification() {
+  if (!state.settings.sessionNotification || !("Notification" in window) || Notification.permission !== "granted" || !runtime) return false;
+  const registration = await activeServiceWorkerRegistration();
+  if (!registration) return false;
+  const phase = runtime.sequence[runtime.stepIndex];
+  const notificationIcon = new URL("./icon-192.png", location.href).href;
+  await registration.showNotification(`Anhad · ${CATEGORY_META[phase.category].label}`, {
+    body: sessionNotificationBody(),
+    icon: notificationIcon,
+    badge: notificationIcon,
+    tag: "anhad-session-timer",
+    silent: true,
+    requireInteraction: true,
+    timestamp: Date.now(),
+    data: { url: "./", kind: "session" }
+  }).catch((error) => console.warn("No se pudo mostrar el temporizador en notificaciones.", error));
+  return true;
+}
+
+async function showCompletedNotification() {
+  if (!state.settings.sessionNotification || !("Notification" in window) || Notification.permission !== "granted") return;
+  const registration = await activeServiceWorkerRegistration();
+  if (!registration) return;
+  const notificationIcon = new URL("./icon-192.png", location.href).href;
+  await registration.showNotification("Anhad · Sesión completada", {
+    body: `Has meditado ${formatClock(runtime.durationSec)}. Abre Anhad para guardar tus notas.`,
+    icon: notificationIcon,
+    badge: notificationIcon,
+    tag: "anhad-session-timer",
+    requireInteraction: true,
+    data: { url: "./", kind: "session-complete" }
+  }).catch(() => {});
+}
+
+async function closeSessionNotification() {
+  const registration = await activeServiceWorkerRegistration();
+  if (!registration?.getNotifications) return;
+  const notifications = await registration.getNotifications({ tag: "anhad-session-timer" }).catch(() => []);
+  notifications.forEach((notification) => notification.close());
+}
+
 async function requestWakeLock() {
   try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
 }
@@ -1295,11 +1651,16 @@ function releaseWakeLock() {
   wakeLock = null;
 }
 
-async function requestNotifications() {
-  if (!("Notification" in window)) return toast("Este navegador no admite notificaciones.", "warning");
-  const result = await Notification.requestPermission();
-  toast(result === "granted" ? "Notificaciones activadas." : "No se concedió el permiso.", result === "granted" ? "success" : "warning");
-  render();
+async function requestNotifications({ quiet = false } = {}) {
+  if (!("Notification" in window)) {
+    if (!quiet) toast("Este navegador no admite notificaciones.", "warning");
+    return false;
+  }
+  const result = Notification.permission === "default" ? await Notification.requestPermission() : Notification.permission;
+  if (!quiet) toast(result === "granted" ? "Notificaciones activadas." : "No se concedió el permiso.", result === "granted" ? "success" : "warning");
+  const button = document.querySelector('[data-action="notifications"]');
+  if (button && result === "granted") button.textContent = "Notificaciones activadas";
+  return result === "granted";
 }
 
 async function checkReminders() {
@@ -1310,9 +1671,9 @@ async function checkReminders() {
     const firedKey = `${reminder.id}:${dateKey(now)}:${time}`;
     if (sessionStorage.getItem("anhad:last-reminder") === firedKey) continue;
     sessionStorage.setItem("anhad:last-reminder", firedKey);
-    playBell(state.settings.bell, state.settings.bellRepeats);
+    playBell(state.settings.bell, state.settings.bellRepeats).catch(showAudioError);
     toast(`Es la hora: ${reminder.label}`, "success");
-    if (Notification.permission === "granted") {
+    if ("Notification" in window && Notification.permission === "granted") {
       const registration = await navigator.serviceWorker?.ready.catch(() => null);
       if (registration) registration.showNotification("Anhad · Es hora de meditar", { body: reminder.label, icon: "icon-192.png", tag: reminder.id, vibrate: [180, 80, 180] });
       else new Notification("Anhad · Es hora de meditar", { body: reminder.label });
@@ -1372,15 +1733,27 @@ async function fileAsDataUrl(file, maxBytes) {
 }
 
 async function loadCustomBell(event) {
+  const file = event.target.files?.[0];
+  if (!file) return;
   try {
-    const previous = { customBell: state.settings.customBell, bell: state.settings.bell };
-    state.settings.customBell = await fileAsDataUrl(event.target.files[0], 1.5 * 1024 * 1024);
+    const extension = file.name.split(".").pop()?.toLowerCase();
+    const validExtensions = ["mp3", "m4a", "wav", "aac", "ogg", "oga", "flac"];
+    if (!file.type.startsWith("audio/") && !validExtensions.includes(extension)) throw new Error("Elige un archivo MP3, M4A, WAV, AAC, OGG o FLAC.");
+    if (file.size > 12 * 1024 * 1024) throw new Error("El archivo de audio debe pesar menos de 12 MB.");
+    const context = await ensureAudio();
+    const decoded = await context.decodeAudioData(await file.arrayBuffer()).catch(() => null);
+    if (!decoded) throw new Error("El móvil no puede decodificar este archivo. Prueba con MP3, M4A o WAV.");
+    await mediaDatabasePut("custom-bell", file);
+    const previous = { customBell: state.settings.customBell, customBellName: state.settings.customBellName, bell: state.settings.bell };
+    state.settings.customBell = null;
+    state.settings.customBellName = file.name;
     state.settings.bell = "custom";
     if (!saveState({ notify: false })) {
       Object.assign(state.settings, previous);
       saveState({ notify: false });
       throw new Error("No hay espacio suficiente para guardar este sonido.");
     }
+    customBellBuffer = decoded;
     toast("Sonido propio guardado en este dispositivo.", "success");
     render();
   } catch (error) { toast(error.message, "warning"); }
@@ -1420,9 +1793,28 @@ async function importData(event) {
 }
 
 function registerPwa() {
-  if ("serviceWorker" in navigator) navigator.serviceWorker.register("./service-worker.js").catch(() => {});
   addEventListener("beforeinstallprompt", (event) => { event.preventDefault(); installPrompt = event; if (ui.view === "ajustes") render(); });
   addEventListener("appinstalled", () => { installPrompt = null; toast("Anhad se ha instalado en tu dispositivo.", "success"); });
+  if (!("serviceWorker" in navigator)) {
+    updateOfflineIndicators();
+    return;
+  }
+  navigator.serviceWorker.register("./service-worker.js", { updateViaCache: "none" }).then(async (registration) => {
+    pwaRegistration = registration;
+    await registration.update().catch(() => {});
+    pwaRegistration = await navigator.serviceWorker.ready;
+    offlineReady = true;
+    updateOfflineIndicators();
+    navigator.storage?.persist?.().catch(() => false);
+  }).catch((error) => {
+    console.warn("No se pudo preparar Anhad para funcionar offline.", error);
+    updateOfflineIndicators();
+    toast("No se pudo preparar el modo offline. Abre Anhad con conexión y recarga una vez.", "warning");
+  });
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    offlineReady = true;
+    updateOfflineIndicators();
+  });
 }
 
 function restoreRuntime() {
@@ -1431,7 +1823,12 @@ function restoreRuntime() {
     saveRuntime();
     return;
   }
-  if (runtime.status === "running") startTimerLoop();
+  if (runtime.status === "running") {
+    startTimerLoop();
+    if (state.settings.sessionNotification) startSessionAudio().then(() => updateMediaSession());
+    scheduleSessionBells();
+    updateSessionNotification();
+  }
 }
 
 document.addEventListener("visibilitychange", () => {
@@ -1440,13 +1837,16 @@ document.addEventListener("visibilitychange", () => {
     if (runtime?.status === "running") {
       requestWakeLock();
       updateTimer();
+      if (state.settings.sessionNotification) startSessionAudio().then(() => updateMediaSession());
+      if (!sessionBellsScheduled) scheduleSessionBells();
+      updateSessionNotification();
     }
   }
 });
 
 matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => state.settings.theme === "system" && setTheme());
-window.addEventListener("online", () => toast("Conexión recuperada. Anhad sigue guardando todo en tu dispositivo."));
-window.addEventListener("offline", () => toast("Estás offline. La práctica seguirá funcionando.", "success"));
+window.addEventListener("online", () => { updateOfflineIndicators(); toast("Conexión recuperada. Anhad sigue guardando todo en tu dispositivo."); });
+window.addEventListener("offline", () => { updateOfflineIndicators(); toast("Estás offline. La práctica seguirá funcionando.", "success"); });
 
 const originalRender = render;
 render = function renderWithModalBindings() {
