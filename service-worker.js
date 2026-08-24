@@ -1,4 +1,4 @@
-const CACHE_NAME = "anhad-offline-v2";
+const CACHE_NAME = "anhad-offline-v3";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -10,9 +10,16 @@ const APP_SHELL = [
   "./icon-512.png",
   "./og.png"
 ];
+const scopeUrl = new URL("./", self.registration.scope).href;
+const offlineUrl = new URL("./index.html", self.registration.scope).href;
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)).then(() => self.skipWaiting()));
+  event.waitUntil((async () => {
+    const cache = await caches.open(CACHE_NAME);
+    const requests = APP_SHELL.map((path) => new Request(new URL(path, self.registration.scope), { cache: "reload" }));
+    await cache.addAll(requests);
+    await self.skipWaiting();
+  })());
 });
 
 self.addEventListener("activate", (event) => {
@@ -21,20 +28,41 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
-  event.respondWith(
-    caches.match(event.request).then((cached) => cached || fetch(event.request).then((response) => {
-      const copy = response.clone();
-      caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+  if (event.request.mode === "navigate") {
+    event.respondWith((async () => {
+      const cache = await caches.open(CACHE_NAME);
+      try {
+        const response = await fetch(event.request);
+        if (response.ok) {
+          await Promise.all([cache.put(scopeUrl, response.clone()), cache.put(offlineUrl, response.clone())]);
+        }
+        return response;
+      } catch {
+        return await cache.match(event.request, { ignoreSearch: true })
+          || await cache.match(offlineUrl)
+          || await cache.match(scopeUrl)
+          || new Response("Anhad no pudo abrirse offline.", { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } });
+      }
+    })());
+    return;
+  }
+  if (new URL(event.request.url).origin !== self.location.origin) return;
+  event.respondWith((async () => {
+    const cache = await caches.open(CACHE_NAME);
+    const cached = await cache.match(event.request, { ignoreSearch: true });
+    if (cached) return cached;
+    return fetch(event.request).then(async (response) => {
+      if (response.ok) await cache.put(event.request, response.clone());
       return response;
-    }).catch(() => event.request.mode === "navigate" ? caches.match("./index.html") : caches.match(event.request)))
-  );
+    }).catch(() => cache.match(event.request, { ignoreSearch: true }));
+  })());
 });
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   event.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clients) => {
     const openClient = clients.find((client) => "focus" in client);
-    return openClient ? openClient.focus() : self.clients.openWindow("./");
+    return openClient ? openClient.focus() : self.clients.openWindow(event.notification.data?.url || "./");
   }));
 });
 
