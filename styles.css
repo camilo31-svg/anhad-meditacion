@@ -444,6 +444,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--gold); box-shado
 .notification-note { display: grid; grid-template-columns: 25px 1fr; gap: 8px; margin: 12px 0; padding: 10px; border-radius: 10px; background: color-mix(in srgb, var(--gold-soft) 60%, transparent); }
 .notification-note > span { width: 21px; height: 21px; display: grid; place-items: center; border: 1px solid var(--gold); border-radius: 50%; color: var(--gold-ink); font-family: Georgia, serif; font-style: italic; }
 .notification-note p { margin: 0; color: var(--muted); font-size: 9px; }
+.file-hint { margin: 8px 0 2px; color: var(--muted); font-size: 9px; line-height: 1.45; }
 .reminder-list { display: grid; }
 .reminder-row { display: grid; grid-template-columns: 1fr 36px 45px; align-items: center; gap: 4px; padding: 10px 0; border-bottom: 1px solid var(--line); }
 .reminder-main { display: grid; grid-template-columns: 58px 1fr; align-items: center; gap: 8px; border: 0; text-align: left; background: transparent; }
