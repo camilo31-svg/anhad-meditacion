@@ -1,4 +1,4 @@
-const CACHE_NAME = "anhad-offline-v5";
+const CACHE_NAME = "anhad-offline-v6";
 const APP_SHELL = [
   "./",
   "./index.html",
