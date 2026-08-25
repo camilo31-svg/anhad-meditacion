@@ -64,7 +64,7 @@ test("numeric controls persist on input without rebuilding the active screen", a
 
 test("offline shell precaches the app and falls back for navigations", async () => {
   const worker = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
-  assert.match(worker, /anhad-offline-v5/);
+  assert.match(worker, /anhad-offline-v6/);
   assert.match(worker, /cache\.addAll\(requests\)/);
   assert.match(worker, /event\.request\.mode === "navigate"/);
   assert.match(worker, /ignoreSearch: true/);
@@ -92,10 +92,37 @@ test("mobile audio primes playback and schedules transition bells", async () => 
 
 test("lock-screen timer follows the active meditation phase", async () => {
   const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
-  const mediaSession = source.slice(source.indexOf("function updateMediaSession"), source.indexOf("function sessionNotificationBody"));
+  const mediaSession = source.slice(source.indexOf("function updateMediaSessionPosition"), source.indexOf("function sessionNotificationBody"));
   assert.match(mediaSession, /const duration = phase\.durationSec/);
-  assert.match(mediaSession, /position: clamp\(currentPhaseElapsed\(\), 0, duration\)/);
+  assert.match(mediaSession, /position = duration > 0 \? clamp\(currentPhaseElapsed\(\), 0, duration\)/);
+  assert.match(mediaSession, /setPositionState\(\{ duration, playbackRate: 1, position \}\)/);
+  assert.match(mediaSession, /updateMediaSessionPosition\(\{ force: true \}\)/);
+  assert.match(source, /updateMediaSessionPosition\(\);\s*updateTimerDom\(\)/);
   assert.doesNotMatch(mediaSession, /totalElapsed/);
   assert.match(source, /Volviendo a<br \/>Sach Khand/);
+
+  const positionFunction = source.slice(source.indexOf("function updateMediaSessionPosition"), source.indexOf("function updateMediaSession()"));
+  const updates = [];
+  const runtime = { id: "test-session", status: "running", stepIndex: 0, sequence: [{ durationSec: 1800 }] };
+  let elapsed = 0;
+  const createPositionUpdater = new Function("navigator", "runtime", "currentPhaseElapsed", "clamp", `
+    let lastMediaPositionState = "";
+    ${positionFunction}
+    return updateMediaSessionPosition;
+  `);
+  const updatePosition = createPositionUpdater(
+    { mediaSession: { setPositionState: (value) => updates.push(value) } },
+    runtime,
+    () => elapsed,
+    (value, min, max) => Math.min(max, Math.max(min, value))
+  );
+  assert.equal(updatePosition(), true);
+  assert.equal(updatePosition(), true);
+  elapsed = 1;
+  assert.equal(updatePosition(), true);
+  elapsed = 17;
+  assert.equal(updatePosition(), true);
+  assert.deepEqual(updates.map((value) => value.position), [0, 1, 17]);
+  assert.ok(updates.every((value) => value.duration === 1800 && value.playbackRate === 1));
 });
 
