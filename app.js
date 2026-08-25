@@ -131,6 +131,7 @@ let lockBellPreparedFor = null;
 let lockBellPrimed = false;
 let lockBellRepeatsRemaining = 0;
 let lockBellSourceGeneration = 0;
+let lastMediaPositionState = "";
 let scheduledBellNodes = [];
 let sessionBellsScheduled = false;
 let bellScheduleGeneration = 0;
@@ -619,6 +620,7 @@ function updateTimer() {
     render();
     return;
   }
+  updateMediaSessionPosition();
   updateTimerDom();
 }
 
@@ -1775,6 +1777,7 @@ function stopSessionAudio() {
     navigator.mediaSession.metadata = null;
     try { navigator.mediaSession.setPositionState(); } catch {}
   }
+  lastMediaPositionState = "";
 }
 
 function phaseRemainingSeconds() {
@@ -1788,6 +1791,23 @@ function phaseEndText() {
   if (runtime?.status === "paused") return `${formatClock(remaining)} pendientes en esta fase`;
   const end = new Date(Date.now() + remaining * 1000);
   return `La fase termina a las ${end.toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" })}`;
+}
+
+function updateMediaSessionPosition({ force = false } = {}) {
+  if (!("mediaSession" in navigator) || !runtime || !["running", "paused"].includes(runtime.status)) return false;
+  const phase = runtime.sequence[runtime.stepIndex];
+  const duration = phase.durationSec || 0;
+  const position = duration > 0 ? clamp(currentPhaseElapsed(), 0, duration) : 0;
+  const stateKey = `${runtime.id}:${runtime.stepIndex}:${runtime.status}:${duration}:${position}`;
+  if (!force && stateKey === lastMediaPositionState) return true;
+  try {
+    if (duration > 0) navigator.mediaSession.setPositionState({ duration, playbackRate: 1, position });
+    else navigator.mediaSession.setPositionState();
+    lastMediaPositionState = stateKey;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function updateMediaSession() {
@@ -1804,14 +1824,7 @@ function updateMediaSession() {
     ]
   });
   navigator.mediaSession.playbackState = runtime.status === "paused" ? "paused" : "playing";
-  const duration = phase.durationSec || 0;
-  if (duration > 0) {
-    try {
-      navigator.mediaSession.setPositionState({ duration, playbackRate: 1, position: clamp(currentPhaseElapsed(), 0, duration) });
-    } catch {}
-  } else {
-    try { navigator.mediaSession.setPositionState(); } catch {}
-  }
+  updateMediaSessionPosition({ force: true });
 }
 
 function sessionNotificationBody() {
