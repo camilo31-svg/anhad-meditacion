@@ -64,11 +64,36 @@ test("numeric controls persist on input without rebuilding the active screen", a
 
 test("offline shell precaches the app and falls back for navigations", async () => {
   const worker = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
-  assert.match(worker, /anhad-offline-v6/);
+  assert.match(worker, /anhad-offline-v7/);
   assert.match(worker, /cache\.addAll\(requests\)/);
   assert.match(worker, /event\.request\.mode === "navigate"/);
   assert.match(worker, /ignoreSearch: true/);
   assert.match(worker, /cache\.match\(offlineUrl\)/);
+});
+
+test("the installed app and notification clicks stay inside Anhad", async () => {
+  const manifest = JSON.parse(await readFile(new URL("../manifest.webmanifest", import.meta.url), "utf8"));
+  const worker = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
+  const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
+  assert.equal(manifest.id, "/anhad-meditacion/");
+  assert.equal(manifest.start_url, "/anhad-meditacion/");
+  assert.equal(manifest.scope, "/anhad-meditacion/");
+  assert.match(worker, /clientUrl\.pathname\.startsWith\(appUrl\.pathname\)/);
+  assert.match(worker, /openWindow\(scopeUrl\)/);
+  assert.match(source, /data: \{ url: APP_HOME_URL, kind: "session" \}/);
+});
+
+test("iOS presentation exposes the version and prevents form zoom", async () => {
+  const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../styles.css", import.meta.url), "utf8");
+  const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(packageJson.version, "1.1.0");
+  assert.match(source, /const APP_VERSION = "1\.1\.0"/);
+  assert.match(source, /class="app-version"/);
+  assert.match(source, /function releaseMobileFocus/);
+  assert.match(styles, /iOS-inspired Liquid Glass interface/);
+  assert.match(styles, /input:not\(\[type="checkbox"\]\):not\(\[type="range"\]\), textarea, select \{[\s\S]*?font-size: 16px/);
+  assert.match(styles, /backdrop-filter: blur\(28px\) saturate\(185%\)/);
 });
 
 test("mobile audio primes playback and schedules transition bells", async () => {

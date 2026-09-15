@@ -24,6 +24,8 @@ import {
 
 const STORAGE_KEY = "anhad:state:v1";
 const RUNTIME_KEY = "anhad:runtime:v1";
+const APP_VERSION = "1.1.0";
+const APP_HOME_URL = new URL("./", import.meta.url).href;
 const WEEKDAYS = ["L", "M", "X", "J", "V", "S", "D"];
 const WEEKDAY_CODES = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
 const MONTHS = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
@@ -231,7 +233,7 @@ function setTheme() {
   document.documentElement.style.setProperty("--custom-background", state.settings.background === "custom" && state.settings.customBackground ? `url(${state.settings.customBackground})` : "none");
   const prefersDark = matchMedia("(prefers-color-scheme: dark)").matches;
   const dark = state.settings.theme === "dark" || (state.settings.theme === "system" && prefersDark);
-  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", dark ? "#0f201f" : "#f7f3eb");
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", dark ? "#09101a" : "#eef4fb");
 }
 
 function brandMark() {
@@ -254,7 +256,7 @@ function shell(content, options = {}) {
       <header class="topbar ${options.transparent ? "transparent" : ""}">
         ${back}
         ${options.title ? `<strong class="topbar-title">${escapeHtml(options.title)}</strong>` : ""}
-        ${right}
+        <div class="topbar-actions"><span class="app-version" aria-label="Versión ${APP_VERSION}">v${APP_VERSION}</span>${right}</div>
       </header>
       <main class="main-content ${options.mainClass || ""}">${content}</main>
       ${showNav ? bottomNav() : ""}
@@ -309,6 +311,14 @@ function closeModal() {
   ui.modal = null;
   ui.detailId = null;
   render();
+}
+
+function releaseMobileFocus({ moveToTop = false } = {}) {
+  const active = document.activeElement;
+  if (active && active !== document.body && typeof active.blur === "function") active.blur();
+  requestAnimationFrame(() => {
+    if (moveToTop) window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+  });
 }
 
 function simpleTotalMinutes() {
@@ -750,6 +760,7 @@ function finishSession(natural = false, forcedEnd = Date.now()) {
   releaseWakeLock();
   if (natural) showCompletedNotification();
   else closeSessionNotification();
+  releaseMobileFocus({ moveToTop: true });
   render();
 }
 
@@ -787,6 +798,7 @@ function renderCompletion() {
   document.querySelector('[data-action="save-session"]')?.addEventListener("click", saveCompletedSession);
   document.querySelector('[data-action="discard-session"]')?.addEventListener("click", () => {
     if (!confirm("¿Descartar esta sesión sin guardarla?")) return;
+    releaseMobileFocus({ moveToTop: true });
     closeSessionNotification();
     runtime = null;
     saveRuntime();
@@ -797,6 +809,7 @@ function renderCompletion() {
 
 function saveCompletedSession() {
   runtime.notes = document.querySelector("#session-notes")?.value || runtime.notes || "";
+  releaseMobileFocus({ moveToTop: true });
   const firstCategory = Object.keys(runtime.breakdown || {})[0] || "luz";
   state.sessions.push({
     id: runtime.id,
@@ -1852,7 +1865,7 @@ async function updateSessionNotification() {
     silent: true,
     requireInteraction: true,
     timestamp: Date.now(),
-    data: { url: "./", kind: "session" }
+    data: { url: APP_HOME_URL, kind: "session" }
   }).catch((error) => console.warn("No se pudo mostrar el temporizador en notificaciones.", error));
   return true;
 }
@@ -1868,7 +1881,7 @@ async function showCompletedNotification() {
     badge: notificationIcon,
     tag: "anhad-session-timer",
     requireInteraction: true,
-    data: { url: "./", kind: "session-complete" }
+    data: { url: APP_HOME_URL, kind: "session-complete" }
   }).catch(() => {});
 }
 
