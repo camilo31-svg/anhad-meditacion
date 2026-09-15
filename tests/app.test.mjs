@@ -8,6 +8,7 @@ import {
   dailySeries,
   dateKey,
   formatClock,
+  hourlyMarkerOffsets,
   summarizeSessions,
   wordFrequencies
 } from "../core.js";
@@ -27,6 +28,13 @@ function session(day, minutes, category = "luz", notes = "") {
 test("formats meditation clocks", () => {
   assert.equal(formatClock(65), "01:05");
   assert.equal(formatClock(3661), "01:01:01");
+});
+
+test("hourly markers omit the final phase boundary", () => {
+  assert.deepEqual(hourlyMarkerOffsets(3600), []);
+  assert.deepEqual(hourlyMarkerOffsets(3601), [3600]);
+  assert.deepEqual(hourlyMarkerOffsets(3 * 3600), [3600, 7200]);
+  assert.deepEqual(hourlyMarkerOffsets(150 * 60), [3600, 7200]);
 });
 
 test("calculates a goal-based streak", () => {
@@ -64,7 +72,7 @@ test("numeric controls persist on input without rebuilding the active screen", a
 
 test("offline shell precaches the app and falls back for navigations", async () => {
   const worker = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
-  assert.match(worker, /anhad-offline-v7/);
+  assert.match(worker, /anhad-offline-v8/);
   assert.match(worker, /cache\.addAll\(requests\)/);
   assert.match(worker, /event\.request\.mode === "navigate"/);
   assert.match(worker, /ignoreSearch: true/);
@@ -87,13 +95,33 @@ test("iOS presentation exposes the version and prevents form zoom", async () => 
   const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
   const styles = await readFile(new URL("../styles.css", import.meta.url), "utf8");
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-  assert.equal(packageJson.version, "1.1.0");
-  assert.match(source, /const APP_VERSION = "1\.1\.0"/);
+  assert.equal(packageJson.version, "1.2.0");
+  assert.match(source, /const APP_VERSION = "1\.2\.0"/);
   assert.match(source, /class="app-version"/);
   assert.match(source, /function releaseMobileFocus/);
   assert.match(styles, /iOS-inspired Liquid Glass interface/);
   assert.match(styles, /input:not\(\[type="checkbox"\]\):not\(\[type="range"\]\), textarea, select \{[\s\S]*?font-size: 16px/);
   assert.match(styles, /backdrop-filter: blur\(28px\) saturate\(185%\)/);
+});
+
+test("bottom navigation floats outside the blurred app shell", async () => {
+  const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../styles.css", import.meta.url), "utf8");
+  const shell = source.slice(source.indexOf("function shell"), source.indexOf("function bottomNav"));
+  assert.match(shell, /<\/div>\s*\$\{showNav \? bottomNav\(\) : ""\}/);
+  assert.match(styles, /\.bottom-nav \{[\s\S]*?position: fixed/);
+  assert.match(styles, /\.bottom-nav \{[\s\S]*?z-index: 40/);
+});
+
+test("dawn reminders and hourly chimes are configurable", async () => {
+  const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
+  assert.match(source, /data-action="add-dawn-reminder"/);
+  assert.match(source, /Meditación de madrugada/);
+  assert.match(source, /time: "04:00"/);
+  assert.match(source, /hourlyChime: false/);
+  assert.match(source, /function playHourlyChime/);
+  assert.match(source, /hourlyMarkerOffsets\(phase\.durationSec\)/);
+  assert.match(source, /scheduleBellAt\("hourly", 1/);
 });
 
 test("mobile audio primes playback and schedules transition bells", async () => {

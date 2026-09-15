@@ -5,6 +5,7 @@ import {
   pad,
   formatClock,
   formatMinutes,
+  hourlyMarkerOffsets,
   dateKey,
   localDateTime,
   startOfDay,
@@ -24,7 +25,7 @@ import {
 
 const STORAGE_KEY = "anhad:state:v1";
 const RUNTIME_KEY = "anhad:runtime:v1";
-const APP_VERSION = "1.1.0";
+const APP_VERSION = "1.2.0";
 const APP_HOME_URL = new URL("./", import.meta.url).href;
 const WEEKDAYS = ["L", "M", "X", "J", "V", "S", "D"];
 const WEEKDAY_CODES = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
@@ -62,6 +63,7 @@ const defaultState = {
     startBell: true,
     endBell: true,
     intervalMinutes: 0,
+    hourlyChime: false,
     fadeIn: true,
     vibration: true,
     sessionNotification: true,
@@ -153,7 +155,8 @@ const ui = {
   statsRange: "1m",
   customFrom: dateKey(startOfMonth()),
   customTo: dateKey(),
-  notesOpen: true
+  notesOpen: true,
+  reminderPreset: null
 };
 
 const app = document.querySelector("#app");
@@ -259,8 +262,8 @@ function shell(content, options = {}) {
         <div class="topbar-actions"><span class="app-version" aria-label="Versión ${APP_VERSION}">v${APP_VERSION}</span>${right}</div>
       </header>
       <main class="main-content ${options.mainClass || ""}">${content}</main>
-      ${showNav ? bottomNav() : ""}
     </div>
+    ${showNav ? bottomNav() : ""}
     ${renderModal()}`;
 }
 
@@ -310,6 +313,7 @@ function bindCommonEvents() {
 function closeModal() {
   ui.modal = null;
   ui.detailId = null;
+  ui.reminderPreset = null;
   render();
 }
 
@@ -430,7 +434,8 @@ function advancedStep(step, index) {
 }
 
 function startArea(total) {
-  return `<button class="start-button" type="button" data-action="start-session"><span>${state.advanced.openEnded && state.mode === "advanced" ? "Comenzar sesión abierta" : "Comenzar meditación"}</span><b>→</b></button>
+  return `<label class="switch-row hourly-chime-option"><span><strong>Aviso al completar cada hora</strong><small>Toque breve en cada hora completa, excepto al terminar la etapa</small></span><input type="checkbox" data-hourly-chime ${state.settings.hourlyChime ? "checked" : ""} /><i></i></label>
+    <button class="start-button" type="button" data-action="start-session"><span>${state.advanced.openEnded && state.mode === "advanced" ? "Comenzar sesión abierta" : "Comenzar meditación"}</span><b>→</b></button>
     <p class="bell-note">${state.settings.bell === "silencio" ? "Transiciones por vibración, sin sonido" : "Una campana suave marcará cada transición"} · <span data-meditation-total>${total || 0} min</span></p>`;
 }
 
@@ -507,6 +512,10 @@ function bindMeditateEvents() {
     const startLabel = document.querySelector('[data-action="start-session"] span');
     if (startLabel) startLabel.textContent = event.target.checked ? "Comenzar sesión abierta" : "Comenzar meditación";
   });
+  document.querySelector("[data-hourly-chime]")?.addEventListener("change", (event) => {
+    state.settings.hourlyChime = event.target.checked;
+    saveState();
+  });
   document.querySelector('[data-action="choose-category"]')?.addEventListener("click", () => {
     ui.modal = "category";
     render();
@@ -557,6 +566,7 @@ async function startSession() {
     pausedAt: null,
     pausedTotalMs: 0,
     lastInterval: 0,
+    lastHourlyMarkerSec: 0,
     notes: "",
     mood: ""
   };
@@ -608,20 +618,30 @@ function updateTimer() {
       runtime.stepIndex += 1;
       runtime.phaseStartedAt = boundary;
       runtime.lastInterval = 0;
+      runtime.lastHourlyMarkerSec = 0;
       if (!sessionBellsScheduled) playSessionBell(1).catch(showAudioError);
       saveRuntime();
       phase = runtime.sequence[runtime.stepIndex];
       elapsed = currentPhaseElapsed();
       phaseChanged = true;
     }
+    const dueHourlyMarker = state.settings.hourlyChime
+      ? hourlyMarkerOffsets(phase.durationSec).filter((offset) => offset <= elapsed).at(-1) || 0
+      : 0;
+    const hasNewHourlyMarker = dueHourlyMarker > (runtime.lastHourlyMarkerSec || 0);
     const interval = Number(state.settings.intervalMinutes) * 60;
     if (interval > 0 && elapsed >= interval) {
       const intervalIndex = Math.floor(elapsed / interval);
       if (intervalIndex > (runtime.lastInterval || 0)) {
         runtime.lastInterval = intervalIndex;
-        if (!sessionBellsScheduled) playSessionBell(1).catch(showAudioError);
+        if (!sessionBellsScheduled && !hasNewHourlyMarker) playSessionBell(1).catch(showAudioError);
         saveRuntime();
       }
+    }
+    if (hasNewHourlyMarker) {
+      runtime.lastHourlyMarkerSec = dueHourlyMarker;
+      if (!sessionBellsScheduled) playHourlyChime().catch(showAudioError);
+      saveRuntime();
     }
   }
   if (phaseChanged) {
@@ -1002,7 +1022,8 @@ function renderSettings() {
       <div class="two-fields"><label>Objetivo diario<div class="unit-input"><input type="number" min="1" max="1440" value="${state.settings.dailyGoal}" data-setting-number="dailyGoal" /><span>min</span></div></label><label>Objetivo semanal<div class="unit-input"><input type="number" min="1" max="10080" value="${state.settings.weeklyGoal}" data-setting-number="weeklyGoal" /><span>min</span></div></label></div>
       <div class="goal-comparison"><span>Esta semana <b>${formatMinutes(weekSeconds(), { compact: true })}</b></span><div class="goal-track"><span data-weekly-progress style="width:${clamp(weekSeconds() / (state.settings.weeklyGoal * 60) * 100, 0, 100)}%"></span></div></div>
     </section>
-    <section class="settings-section"><div class="settings-heading"><span>⏰</span><div><h2>Alarmas de práctica</h2><p>Recordatorios en este móvil</p></div><button class="small-add" type="button" data-action="add-reminder">＋</button></div>
+    <section class="settings-section"><div class="settings-heading"><span>⏰</span><div><h2>Alarmas de práctica</h2><p>Recordatorios en este móvil</p></div><button class="small-add" type="button" data-action="add-reminder" aria-label="Añadir alarma">＋</button></div>
+      <button class="dawn-reminder-card" type="button" data-action="add-dawn-reminder"><span>☾</span><span><strong>Meditación de madrugada</strong><small>Prepara una alarma entre las 00:00 y las 06:00</small></span><b>Programar</b></button>
       ${state.reminders.length ? `<div class="reminder-list">${state.reminders.map(reminderRow).join("")}</div>` : '<div class="empty-inline"><span>○</span><p>No has creado ninguna alarma.</p></div>'}
       <div class="notification-note"><span>i</span><p>Los avisos suenan mientras Anhad está abierta. Para despertar con fiabilidad, añade cada alarma al calendario del móvil.</p></div>
       <button class="secondary-button" type="button" data-action="notifications">${"Notification" in window && Notification.permission === "granted" ? "Notificaciones activadas" : "Activar notificaciones"}</button>
@@ -1013,7 +1034,7 @@ function renderSettings() {
       <div class="field-grid"><label>Repeticiones<select data-setting-select="bellRepeats">${[1,2,3].map((value) => `<option value="${value}" ${Number(state.settings.bellRepeats) === value ? "selected" : ""}>${value} ${value === 1 ? "toque" : "toques"}</option>`).join("")}</select></label><label>Intervalo adicional<select data-setting-select="intervalMinutes">${[[0, "Sin intervalo"], [5, "Cada 5 min"], [10, "Cada 10 min"], [15, "Cada 15 min"], [30, "Cada 30 min"]].map(([value, label]) => `<option value="${value}" ${Number(state.settings.intervalMinutes) === value ? "selected" : ""}>${label}</option>`).join("")}</select></label></div>
       <div class="button-row"><button class="secondary-button" type="button" data-action="test-bell">Probar campana</button><label class="file-button">Cargar sonido<input type="file" accept="audio/*,.mp3,.m4a,.wav,.aac,.ogg,.oga,.flac" data-file="bell" /></label></div>
       <p class="file-hint">${state.settings.customBellName ? `Sonido propio: ${escapeHtml(state.settings.customBellName)}` : "Formatos: MP3, M4A, WAV, AAC, OGG o FLAC · máximo 12 MB"}</p>
-      ${toggleRow("Campana de inicio", "startBell", state.settings.startBell)}${toggleRow("Campana final", "endBell", state.settings.endBell)}${toggleRow("Entrada gradual", "fadeIn", state.settings.fadeIn)}${toggleRow("Vibración", "vibration", state.settings.vibration)}
+      ${toggleRow("Campana de inicio", "startBell", state.settings.startBell)}${toggleRow("Campana final", "endBell", state.settings.endBell)}${toggleRow("Aviso horario breve", "hourlyChime", state.settings.hourlyChime, "Suena a los 60, 120, 180… minutos, nunca al final de una etapa")}${toggleRow("Entrada gradual", "fadeIn", state.settings.fadeIn)}${toggleRow("Vibración", "vibration", state.settings.vibration)}
     </section>
     <section class="settings-section"><div class="settings-heading"><span>◷</span><div><h2>Temporizador</h2><p>Elige cómo ver tu práctica</p></div></div>
       <div class="segmented-control"><button type="button" class="${state.settings.direction === "countdown" ? "active" : ""}" data-direction="countdown">Cuenta atrás</button><button type="button" class="${state.settings.direction === "countup" ? "active" : ""}" data-direction="countup">Cuenta adelante</button></div>
@@ -1048,7 +1069,9 @@ function toggleRow(label, key, checked, description = "") {
 
 function reminderRow(reminder) {
   const days = reminder.days?.length === 7 ? "Todos los días" : (reminder.days || []).map((day) => WEEKDAYS[day]).join(" · ");
-  return `<div class="reminder-row"><button type="button" class="reminder-main" data-edit-reminder="${reminder.id}"><strong>${escapeHtml(reminder.time)}</strong><span>${escapeHtml(reminder.label)}<small>${days}</small></span></button><button type="button" class="calendar-download" data-ics-reminder="${reminder.id}" aria-label="Añadir al calendario">▦</button><label class="mini-switch"><input type="checkbox" data-reminder-toggle="${reminder.id}" ${reminder.enabled ? "checked" : ""} /><i></i></label></div>`;
+  const hour = Number(String(reminder.time || "00:00").split(":")[0]);
+  const period = hour < 6 ? "Madrugada · " : "";
+  return `<div class="reminder-row"><button type="button" class="reminder-main" data-edit-reminder="${reminder.id}"><strong>${escapeHtml(reminder.time)}</strong><span>${escapeHtml(reminder.label)}<small>${period}${days}</small></span></button><button type="button" class="calendar-download" data-ics-reminder="${reminder.id}" aria-label="Añadir al calendario">▦</button><label class="mini-switch"><input type="checkbox" data-reminder-toggle="${reminder.id}" ${reminder.enabled ? "checked" : ""} /><i></i></label></div>`;
 }
 
 function bindSettingsEvents() {
@@ -1099,8 +1122,9 @@ function bindSettingsEvents() {
   }));
   document.querySelector('[data-action="test-bell"]')?.addEventListener("click", testBell);
   document.querySelector('[data-action="notifications"]')?.addEventListener("click", requestNotifications);
-  document.querySelector('[data-action="add-reminder"]')?.addEventListener("click", () => { ui.modal = "reminder"; ui.detailId = null; render(); });
-  document.querySelectorAll("[data-edit-reminder]").forEach((button) => button.addEventListener("click", () => { ui.modal = "reminder"; ui.detailId = button.dataset.editReminder; render(); }));
+  document.querySelector('[data-action="add-reminder"]')?.addEventListener("click", () => { ui.modal = "reminder"; ui.detailId = null; ui.reminderPreset = null; render(); });
+  document.querySelector('[data-action="add-dawn-reminder"]')?.addEventListener("click", () => { ui.modal = "reminder"; ui.detailId = null; ui.reminderPreset = "dawn"; render(); });
+  document.querySelectorAll("[data-edit-reminder]").forEach((button) => button.addEventListener("click", () => { ui.modal = "reminder"; ui.detailId = button.dataset.editReminder; ui.reminderPreset = null; render(); }));
   document.querySelectorAll("[data-reminder-toggle]").forEach((input) => input.addEventListener("change", () => {
     const reminder = state.reminders.find((item) => item.id === input.dataset.reminderToggle);
     if (reminder) reminder.enabled = input.checked;
@@ -1161,8 +1185,13 @@ function sessionDetailModal() {
 }
 
 function reminderModal() {
-  const reminder = state.reminders.find((item) => item.id === ui.detailId) || { label: "Meditación de la mañana", time: "05:30", days: [0,1,2,3,4,5,6], enabled: true };
-  return modalShell(ui.detailId ? "Editar alarma" : "Nueva alarma", `<form id="reminder-form"><label>Nombre<input name="label" required maxlength="60" value="${escapeHtml(reminder.label)}" /></label><label>Hora<input class="large-time-input" type="time" name="time" required value="${escapeHtml(reminder.time)}" /></label><fieldset><legend>Días</legend><div class="day-choices">${WEEKDAYS.map((day, index) => `<label><input type="checkbox" name="days" value="${index}" ${reminder.days.includes(index) ? "checked" : ""} /><span>${day}</span></label>`).join("")}</div></fieldset><button class="start-button" type="submit"><span>Guardar alarma</span><b>✓</b></button>${ui.detailId ? '<button class="text-button danger-text full-width" type="button" data-action="delete-reminder">Eliminar alarma</button>' : ""}</form>`);
+  const fallback = ui.reminderPreset === "dawn"
+    ? { label: "Meditación de madrugada", time: "04:00", days: [0,1,2,3,4,5,6], enabled: true }
+    : { label: "Meditación de la mañana", time: "05:30", days: [0,1,2,3,4,5,6], enabled: true };
+  const reminder = state.reminders.find((item) => item.id === ui.detailId) || fallback;
+  const title = ui.detailId ? "Editar alarma" : ui.reminderPreset === "dawn" ? "Alarma de madrugada" : "Nueva alarma";
+  const intro = ui.reminderPreset === "dawn" ? '<p class="modal-intro">La hora sugerida es 04:00, pero puedes elegir cualquier hora de la madrugada.</p>' : "";
+  return modalShell(title, `${intro}<form id="reminder-form"><label>Nombre<input name="label" required maxlength="60" value="${escapeHtml(reminder.label)}" /></label><label>Hora<input class="large-time-input" type="time" name="time" required value="${escapeHtml(reminder.time)}" /></label><fieldset><legend>Días</legend><div class="day-choices">${WEEKDAYS.map((day, index) => `<label><input type="checkbox" name="days" value="${index}" ${reminder.days.includes(index) ? "checked" : ""} /><span>${day}</span></label>`).join("")}</div></fieldset><button class="start-button" type="submit"><span>Guardar alarma</span><b>✓</b></button>${ui.detailId ? '<button class="text-button danger-text full-width" type="button" data-action="delete-reminder">Eliminar alarma</button>' : ""}</form>`);
 }
 
 function bindModalSpecific() {
@@ -1267,9 +1296,11 @@ function saveReminder(event) {
   else state.reminders.push(reminder);
   state.reminders.sort((a, b) => a.time.localeCompare(b.time));
   saveState();
+  const isDawnReminder = Number(reminder.time.split(":")[0]) < 6;
   ui.modal = null;
   ui.detailId = null;
-  toast("Alarma guardada.", "success");
+  ui.reminderPreset = null;
+  toast(isDawnReminder ? "Alarma de madrugada guardada. Usa ▦ para añadirla al calendario del móvil." : "Alarma guardada.", "success");
   render();
 }
 
@@ -1315,7 +1346,8 @@ const BELL_PROFILES = {
   cuenco: { base: 220, partials: [1, 2.01, 3.12, 4.17], duration: 4.6 },
   tibetana: { base: 330, partials: [1, 1.5, 2.01, 2.74], duration: 3.8 },
   gong: { base: 110, partials: [1, 1.41, 2.18, 2.97], duration: 5.6 },
-  cristal: { base: 523.25, partials: [1, 2, 3, 4.08], duration: 4.2 }
+  cristal: { base: 523.25, partials: [1, 2, 3, 4.08], duration: 4.2 },
+  hourly: { base: 880, partials: [1, 2.01], duration: 1.15, level: 0.2 }
 };
 
 function synthesizedBellBlob(type) {
@@ -1346,7 +1378,7 @@ function synthesizedBellBlob(type) {
     const decay = Math.exp(-5.1 * time / profile.duration);
     const tone = profile.partials.reduce((sum, partial, partialIndex) =>
       sum + Math.sin(2 * Math.PI * profile.base * partial * time) / (partialIndex + 1), 0) / 1.85;
-    const sample = clamp(tone * attack * decay * 0.88, -1, 1);
+    const sample = clamp(tone * attack * decay * (profile.level ? profile.level * 1.9 : 0.88), -1, 1);
     view.setInt16(44 + index * 2, Math.round(sample * 32767), true);
   }
   return new Blob([buffer], { type: "audio/wav" });
@@ -1369,7 +1401,7 @@ function scheduleSynthBell(context, type, repeats, startAt, nodes = null) {
       oscillator.type = index === 0 ? "sine" : "triangle";
       oscillator.frequency.setValueAtTime(profile.base * partial, start);
       oscillator.detune.setValueAtTime((index - 1) * 2.5, start);
-      const peak = state.settings.volume * (0.46 / (index + 1));
+      const peak = state.settings.volume * ((profile.level || 0.46) / (index + 1));
       gain.gain.setValueAtTime(0.0001, start);
       gain.gain.exponentialRampToValueAtTime(Math.max(0.0001, peak), start + (state.settings.fadeIn ? 0.08 : 0.012));
       gain.gain.exponentialRampToValueAtTime(0.0001, start + profile.duration);
@@ -1468,6 +1500,23 @@ async function playSessionBell(repeats = 1) {
   return playBell(state.settings.bell, repeats);
 }
 
+async function playHourlyChime() {
+  if (state.settings.bell === "silencio") return true;
+  if (state.settings.sessionNotification && lockBellPrimed) {
+    await prepareLockScreenBell("hourly", { force: lockBellPreparedFor !== "hourly" });
+    const audio = ensureLockBellAudioElement();
+    audio.pause();
+    audio.currentTime = 0;
+    audio.volume = state.settings.volume;
+    lockBellRepeatsRemaining = 0;
+    await audio.play();
+    return true;
+  }
+  const context = await ensureAudio();
+  await scheduleBellAt("hourly", 1, context.currentTime + 0.035);
+  return true;
+}
+
 async function testBell(event) {
   const button = event.currentTarget;
   button.disabled = true;
@@ -1544,9 +1593,18 @@ async function scheduleSessionBells() {
       const phase = runtime.sequence[index];
       if (!phase.durationSec) break;
       const phaseEndMs = phaseStartMs + phase.durationSec * 1000;
+      if (state.settings.hourlyChime) {
+        for (const offsetSec of hourlyMarkerOffsets(phase.durationSec)) {
+          const atMs = phaseStartMs + offsetSec * 1000;
+          if (atMs <= now) continue;
+          await scheduleBellAt("hourly", 1, context.currentTime + (atMs - now) / 1000, { nodes });
+          scheduledAny = true;
+        }
+      }
       if (intervalSec > 0) {
         for (let atMs = phaseStartMs + intervalSec * 1000; atMs < phaseEndMs; atMs += intervalSec * 1000) {
           if (atMs <= now) continue;
+          if (state.settings.hourlyChime && (atMs - phaseStartMs) % (60 * 60 * 1000) === 0) continue;
           await scheduleBellAt(state.settings.bell, 1, context.currentTime + (atMs - now) / 1000, { nodes });
           scheduledAny = true;
         }

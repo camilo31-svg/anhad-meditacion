@@ -40,6 +40,13 @@ export function formatMinutes(totalSeconds, options = {}) {
   return `${minutes} ${minutes === 1 ? "minuto" : "minutos"}`;
 }
 
+export function hourlyMarkerOffsets(durationSec) {
+  const duration = Math.max(0, Number(durationSec) || 0);
+  const offsets = [];
+  for (let offset = 60 * 60; offset < duration; offset += 60 * 60) offsets.push(offset);
+  return offsets;
+}
+
 export function dateKey(input = new Date()) {
   const date = input instanceof Date ? input : new Date(input);
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
