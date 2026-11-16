@@ -1,4 +1,4 @@
-const CACHE_NAME = "anhad-offline-v8";
+const CACHE_NAME = "anhad-offline-v9";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -61,20 +61,23 @@ self.addEventListener("fetch", (event) => {
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   event.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(async (clients) => {
+    const requestedUrl = new URL(event.notification.data?.url || "./", self.registration.scope);
+    const appUrl = new URL(scopeUrl);
+    const targetUrl = requestedUrl.origin === appUrl.origin && requestedUrl.pathname.startsWith(appUrl.pathname)
+      ? requestedUrl.href
+      : scopeUrl;
     const anhadClient = clients.find((client) => {
       try {
         const clientUrl = new URL(client.url);
-        const appUrl = new URL(scopeUrl);
         return clientUrl.origin === appUrl.origin && clientUrl.pathname.startsWith(appUrl.pathname);
       } catch {
         return false;
       }
     });
     if (anhadClient) {
-      if ("navigate" in anhadClient && anhadClient.url !== scopeUrl) await anhadClient.navigate(scopeUrl);
       return anhadClient.focus();
     }
-    return self.clients.openWindow(scopeUrl);
+    return self.clients.openWindow(targetUrl);
   }));
 });
 

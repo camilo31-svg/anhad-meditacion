@@ -25,8 +25,8 @@ import {
 
 const STORAGE_KEY = "anhad:state:v1";
 const RUNTIME_KEY = "anhad:runtime:v1";
-const APP_VERSION = "1.2.0";
-const APP_HOME_URL = new URL("./", import.meta.url).href;
+const APP_VERSION = "1.3.0";
+const APP_NOTIFICATION_URL = new URL("./index.html?source=anhad-notification", import.meta.url).href;
 const WEEKDAYS = ["L", "M", "X", "J", "V", "S", "D"];
 const WEEKDAY_CODES = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
 const MONTHS = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
@@ -434,7 +434,9 @@ function advancedStep(step, index) {
 }
 
 function startArea(total) {
+  const vibrationAvailable = typeof navigator.vibrate === "function";
   return `<label class="switch-row hourly-chime-option"><span><strong>Aviso al completar cada hora</strong><small>Toque breve en cada hora completa, excepto al terminar la etapa</small></span><input type="checkbox" data-hourly-chime ${state.settings.hourlyChime ? "checked" : ""} /><i></i></label>
+    <button class="phase-vibration-button ${vibrationAvailable && state.settings.vibration ? "active" : ""}" type="button" data-action="toggle-phase-vibration" aria-pressed="${vibrationAvailable && state.settings.vibration}"><span>♒</span><strong>${!vibrationAvailable ? "Vibración no disponible" : state.settings.vibration ? "Vibración activada" : "Activar vibración"}</strong><small>${vibrationAvailable ? "Al terminar cada etapa y la sesión" : "Este navegador no permite vibrar desde Anhad"}</small></button>
     <button class="start-button" type="button" data-action="start-session"><span>${state.advanced.openEnded && state.mode === "advanced" ? "Comenzar sesión abierta" : "Comenzar meditación"}</span><b>→</b></button>
     <p class="bell-note">${state.settings.bell === "silencio" ? "Transiciones por vibración, sin sonido" : "Una campana suave marcará cada transición"} · <span data-meditation-total>${total || 0} min</span></p>`;
 }
@@ -516,6 +518,16 @@ function bindMeditateEvents() {
     state.settings.hourlyChime = event.target.checked;
     saveState();
   });
+  document.querySelector('[data-action="toggle-phase-vibration"]')?.addEventListener("click", (event) => {
+    if (typeof navigator.vibrate !== "function") return toast("Este navegador no permite activar la vibración desde una web.", "warning");
+    state.settings.vibration = !state.settings.vibration;
+    saveState();
+    const button = event.currentTarget;
+    button.classList.toggle("active", state.settings.vibration);
+    button.setAttribute("aria-pressed", String(state.settings.vibration));
+    button.querySelector("strong").textContent = state.settings.vibration ? "Vibración activada" : "Activar vibración";
+    if (state.settings.vibration) navigator.vibrate(80);
+  });
   document.querySelector('[data-action="choose-category"]')?.addEventListener("click", () => {
     ui.modal = "category";
     render();
@@ -546,6 +558,7 @@ function sequenceForCurrentMode() {
 async function startSession() {
   const sequence = sequenceForCurrentMode();
   if (!sequence.length) return toast("Añade al menos un paso.", "warning");
+  releaseMobileFocus({ moveToTop: true });
   stopBellPreview({ releaseRoute: false });
   const backgroundPlayback = state.settings.sessionNotification ? startSessionAudio() : Promise.resolve(false);
   const lockBellActivation = state.settings.sessionNotification
@@ -582,6 +595,7 @@ async function startSession() {
   startAmbient();
   requestWakeLock();
   render();
+  releaseMobileFocus({ moveToTop: true });
   startTimerLoop();
 }
 
@@ -619,7 +633,8 @@ function updateTimer() {
       runtime.phaseStartedAt = boundary;
       runtime.lastInterval = 0;
       runtime.lastHourlyMarkerSec = 0;
-      if (!sessionBellsScheduled) playSessionBell(1).catch(showAudioError);
+      if (sessionBellsScheduled) vibratePhaseAlert();
+      else playSessionBell(1).catch(showAudioError);
       saveRuntime();
       phase = runtime.sequence[runtime.stepIndex];
       elapsed = currentPhaseElapsed();
@@ -775,6 +790,7 @@ function finishSession(natural = false, forcedEnd = Date.now()) {
   runtime.natural = natural;
   saveRuntime();
   if (state.settings.endBell && (!natural || !bellsWereScheduled)) playSessionBell(state.settings.bellRepeats).catch(showAudioError);
+  else vibratePhaseAlert();
   stopAmbient();
   stopSessionAudio();
   releaseWakeLock();
@@ -1034,7 +1050,7 @@ function renderSettings() {
       <div class="field-grid"><label>Repeticiones<select data-setting-select="bellRepeats">${[1,2,3].map((value) => `<option value="${value}" ${Number(state.settings.bellRepeats) === value ? "selected" : ""}>${value} ${value === 1 ? "toque" : "toques"}</option>`).join("")}</select></label><label>Intervalo adicional<select data-setting-select="intervalMinutes">${[[0, "Sin intervalo"], [5, "Cada 5 min"], [10, "Cada 10 min"], [15, "Cada 15 min"], [30, "Cada 30 min"]].map(([value, label]) => `<option value="${value}" ${Number(state.settings.intervalMinutes) === value ? "selected" : ""}>${label}</option>`).join("")}</select></label></div>
       <div class="button-row"><button class="secondary-button" type="button" data-action="test-bell">Probar campana</button><label class="file-button">Cargar sonido<input type="file" accept="audio/*,.mp3,.m4a,.wav,.aac,.ogg,.oga,.flac" data-file="bell" /></label></div>
       <p class="file-hint">${state.settings.customBellName ? `Sonido propio: ${escapeHtml(state.settings.customBellName)}` : "Formatos: MP3, M4A, WAV, AAC, OGG o FLAC · máximo 12 MB"}</p>
-      ${toggleRow("Campana de inicio", "startBell", state.settings.startBell)}${toggleRow("Campana final", "endBell", state.settings.endBell)}${toggleRow("Aviso horario breve", "hourlyChime", state.settings.hourlyChime, "Suena a los 60, 120, 180… minutos, nunca al final de una etapa")}${toggleRow("Entrada gradual", "fadeIn", state.settings.fadeIn)}${toggleRow("Vibración", "vibration", state.settings.vibration)}
+      ${toggleRow("Campana de inicio", "startBell", state.settings.startBell)}${toggleRow("Campana final", "endBell", state.settings.endBell)}${toggleRow("Aviso horario breve", "hourlyChime", state.settings.hourlyChime, "Suena a los 60, 120, 180… minutos, nunca al final de una etapa")}${toggleRow("Entrada gradual", "fadeIn", state.settings.fadeIn)}${toggleRow("Vibración al cerrar cada fase", "vibration", state.settings.vibration, "También al terminar la sesión, si el móvil lo permite")}
     </section>
     <section class="settings-section"><div class="settings-heading"><span>◷</span><div><h2>Temporizador</h2><p>Elige cómo ver tu práctica</p></div></div>
       <div class="segmented-control"><button type="button" class="${state.settings.direction === "countdown" ? "active" : ""}" data-direction="countdown">Cuenta atrás</button><button type="button" class="${state.settings.direction === "countup" ? "active" : ""}" data-direction="countup">Cuenta adelante</button></div>
@@ -1478,14 +1494,18 @@ async function scheduleBellAt(type, repeats, startAt, { nodes = null } = {}) {
 
 async function playBell(type = "cuenco", repeats = 1, { nodes = null } = {}) {
   if (type === "silencio") {
-    if (state.settings.vibration) navigator.vibrate?.([180, 80, 180]);
+    vibratePhaseAlert();
     return true;
   }
   const context = await ensureAudio();
   await scheduleBellAt(type, repeats, context.currentTime + 0.035, { nodes });
   audioWarningShown = false;
-  if (state.settings.vibration) navigator.vibrate?.(160);
+  vibratePhaseAlert();
   return true;
+}
+
+function vibratePhaseAlert() {
+  if (state.settings.vibration) navigator.vibrate?.([160, 80, 160]);
 }
 
 async function playSessionBell(repeats = 1) {
@@ -1788,7 +1808,7 @@ async function primeLockScreenBell({ playStartBell = false, repeats = 1 } = {}) 
 
 async function playLockScreenBell(repeats = 1) {
   if (state.settings.bell === "silencio") {
-    if (state.settings.vibration) navigator.vibrate?.([180, 80, 180]);
+    vibratePhaseAlert();
     return true;
   }
   if (lockBellPreparedFor !== state.settings.bell || !lockBellAudio?.src) await prepareLockScreenBell();
@@ -1800,7 +1820,7 @@ async function playLockScreenBell(repeats = 1) {
   await audio.play();
   audioWarningShown = false;
   if (runtime?.status === "running") updateMediaSession();
-  if (state.settings.vibration) navigator.vibrate?.(160);
+  vibratePhaseAlert();
   return true;
 }
 
@@ -1923,7 +1943,7 @@ async function updateSessionNotification() {
     silent: true,
     requireInteraction: true,
     timestamp: Date.now(),
-    data: { url: APP_HOME_URL, kind: "session" }
+    data: { url: APP_NOTIFICATION_URL, kind: "session" }
   }).catch((error) => console.warn("No se pudo mostrar el temporizador en notificaciones.", error));
   return true;
 }
@@ -1939,7 +1959,7 @@ async function showCompletedNotification() {
     badge: notificationIcon,
     tag: "anhad-session-timer",
     requireInteraction: true,
-    data: { url: APP_HOME_URL, kind: "session-complete" }
+    data: { url: APP_NOTIFICATION_URL, kind: "session-complete" }
   }).catch(() => {});
 }
 
@@ -1983,7 +2003,7 @@ async function checkReminders() {
     toast(`Es la hora: ${reminder.label}`, "success");
     if ("Notification" in window && Notification.permission === "granted") {
       const registration = await navigator.serviceWorker?.ready.catch(() => null);
-      if (registration) registration.showNotification("Anhad · Es hora de meditar", { body: reminder.label, icon: "icon-192.png", tag: reminder.id, vibrate: [180, 80, 180] });
+      if (registration) registration.showNotification("Anhad · Es hora de meditar", { body: reminder.label, icon: "icon-192.png", tag: reminder.id, vibrate: [180, 80, 180], data: { url: APP_NOTIFICATION_URL, kind: "reminder" } });
       else new Notification("Anhad · Es hora de meditar", { body: reminder.label });
     }
   }

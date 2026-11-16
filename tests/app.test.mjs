@@ -72,7 +72,7 @@ test("numeric controls persist on input without rebuilding the active screen", a
 
 test("offline shell precaches the app and falls back for navigations", async () => {
   const worker = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
-  assert.match(worker, /anhad-offline-v8/);
+  assert.match(worker, /anhad-offline-v9/);
   assert.match(worker, /cache\.addAll\(requests\)/);
   assert.match(worker, /event\.request\.mode === "navigate"/);
   assert.match(worker, /ignoreSearch: true/);
@@ -87,16 +87,19 @@ test("the installed app and notification clicks stay inside Anhad", async () => 
   assert.equal(manifest.start_url, "/anhad-meditacion/");
   assert.equal(manifest.scope, "/anhad-meditacion/");
   assert.match(worker, /clientUrl\.pathname\.startsWith\(appUrl\.pathname\)/);
-  assert.match(worker, /openWindow\(scopeUrl\)/);
-  assert.match(source, /data: \{ url: APP_HOME_URL, kind: "session" \}/);
+  assert.match(worker, /openWindow\(targetUrl\)/);
+  assert.match(worker, /return anhadClient\.focus\(\)/);
+  assert.doesNotMatch(worker, /anhadClient\.navigate\(/);
+  assert.match(source, /data: \{ url: APP_NOTIFICATION_URL, kind: "session" \}/);
+  assert.match(source, /data: \{ url: APP_NOTIFICATION_URL, kind: "session-complete" \}/);
 });
 
 test("iOS presentation exposes the version and prevents form zoom", async () => {
   const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
   const styles = await readFile(new URL("../styles.css", import.meta.url), "utf8");
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-  assert.equal(packageJson.version, "1.2.0");
-  assert.match(source, /const APP_VERSION = "1\.2\.0"/);
+  assert.equal(packageJson.version, "1.3.0");
+  assert.match(source, /const APP_VERSION = "1\.3\.0"/);
   assert.match(source, /class="app-version"/);
   assert.match(source, /function releaseMobileFocus/);
   assert.match(styles, /iOS-inspired Liquid Glass interface/);
@@ -122,6 +125,24 @@ test("dawn reminders and hourly chimes are configurable", async () => {
   assert.match(source, /function playHourlyChime/);
   assert.match(source, /hourlyMarkerOffsets\(phase\.durationSec\)/);
   assert.match(source, /scheduleBellAt\("hourly", 1/);
+});
+
+test("the meditation editor offers an independent end-of-phase vibration button", async () => {
+  const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
+  assert.match(source, /data-action="toggle-phase-vibration" aria-pressed=/);
+  assert.match(source, /state\.settings\.vibration = !state\.settings\.vibration/);
+  assert.match(source, /if \(sessionBellsScheduled\) vibratePhaseAlert\(\)/);
+  assert.match(source, /else vibratePhaseAlert\(\);/);
+  const start = source.indexOf("function vibratePhaseAlert()");
+  const end = source.indexOf("async function playSessionBell", start);
+  const makeAlert = new Function("state", "navigator", `${source.slice(start, end)} return vibratePhaseAlert;`);
+  const calls = [];
+  const state = { settings: { vibration: true } };
+  const alert = makeAlert(state, { vibrate: (pattern) => calls.push(pattern) });
+  alert();
+  state.settings.vibration = false;
+  alert();
+  assert.deepEqual(calls, [[160, 80, 160]]);
 });
 
 test("mobile audio primes playback and schedules transition bells", async () => {
