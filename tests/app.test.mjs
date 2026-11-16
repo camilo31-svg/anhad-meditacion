@@ -72,7 +72,7 @@ test("numeric controls persist on input without rebuilding the active screen", a
 
 test("offline shell precaches the app and falls back for navigations", async () => {
   const worker = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
-  assert.match(worker, /anhad-offline-v9/);
+  assert.match(worker, /anhad-offline-v10/);
   assert.match(worker, /cache\.addAll\(requests\)/);
   assert.match(worker, /event\.request\.mode === "navigate"/);
   assert.match(worker, /ignoreSearch: true/);
@@ -98,8 +98,8 @@ test("iOS presentation exposes the version and prevents form zoom", async () => 
   const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
   const styles = await readFile(new URL("../styles.css", import.meta.url), "utf8");
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-  assert.equal(packageJson.version, "1.3.0");
-  assert.match(source, /const APP_VERSION = "1\.3\.0"/);
+  assert.equal(packageJson.version, "1.3.1");
+  assert.match(source, /const APP_VERSION = "1\.3\.1"/);
   assert.match(source, /class="app-version"/);
   assert.match(source, /function releaseMobileFocus/);
   assert.match(styles, /iOS-inspired Liquid Glass interface/);
@@ -162,6 +162,22 @@ test("mobile audio primes playback and schedules transition bells", async () => 
   assert.match(source, /playSessionBell\(1\)/);
   assert.match(source, /playSessionBell\(state\.settings\.bellRepeats\)/);
   assert.match(source, /if \(phaseChanged\) \{[\s\S]*?render\(\);[\s\S]*?return;/);
+});
+
+test("finishing a meditation releases the lock-screen media notification", async () => {
+  const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
+  const stopFunction = source.slice(source.indexOf("function stopSessionAudio()"), source.indexOf("function phaseRemainingSeconds()"));
+  const actions = [];
+  const mediaSession = { playbackState: "playing", metadata: { title: "Luz" }, setPositionState: () => actions.push("position") };
+  const audio = { pause: () => actions.push("pause"), removeAttribute: (name) => actions.push(`remove:${name}`), load: () => actions.push("load") };
+  const createStopper = new Function("sessionAudio", "lockBellAudio", "runtime", "navigator", "releaseLockBellPlayback", `let lastMediaPositionState = "old"; ${stopFunction} return stopSessionAudio;`);
+  createStopper(audio, { paused: true }, { status: "complete" }, { mediaSession }, () => actions.push("release-bell"))();
+  assert.deepEqual(actions, ["pause", "remove:src", "load", "release-bell", "position"]);
+  assert.equal(mediaSession.playbackState, "none");
+  assert.equal(mediaSession.metadata, null);
+  assert.match(source, /if \(!sessionAudio\.hasAttribute\("src"\)\) sessionAudio\.src = SESSION_AUDIO_URL/);
+  assert.match(source, /sessionAudio = new Audio\(SESSION_AUDIO_URL\)/);
+  assert.match(source, /else \{\s*releaseLockBellPlayback\(\)/);
 });
 
 test("lock-screen timer follows the active meditation phase", async () => {

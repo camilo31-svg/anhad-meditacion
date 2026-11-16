@@ -25,8 +25,9 @@ import {
 
 const STORAGE_KEY = "anhad:state:v1";
 const RUNTIME_KEY = "anhad:runtime:v1";
-const APP_VERSION = "1.3.0";
+const APP_VERSION = "1.3.1";
 const APP_NOTIFICATION_URL = new URL("./index.html?source=anhad-notification", import.meta.url).href;
+const SESSION_AUDIO_URL = new URL("./session-hold.wav", import.meta.url).href;
 const WEEKDAYS = ["L", "M", "X", "J", "V", "S", "D"];
 const WEEKDAY_CODES = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
 const MONTHS = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
@@ -1723,9 +1724,22 @@ function ensureLockBellAudioElement() {
     }
     if (runtime?.status === "running" && state.settings.sessionNotification) {
       startSessionAudio().then(() => updateMediaSession());
+    } else {
+      releaseLockBellPlayback();
     }
   });
   return lockBellAudio;
+}
+
+function releaseLockBellPlayback() {
+  if (!lockBellAudio) return;
+  lockBellAudio.pause();
+  lockBellAudio.removeAttribute("src");
+  lockBellAudio.load();
+  lockBellRepeatsRemaining = 0;
+  lockBellPreparedFor = null;
+  lockBellPrimed = false;
+  releaseLockBellObjectUrl();
 }
 
 function releaseLockBellObjectUrl() {
@@ -1825,8 +1839,11 @@ async function playLockScreenBell(repeats = 1) {
 }
 
 function ensureSessionAudioElement() {
-  if (sessionAudio) return sessionAudio;
-  sessionAudio = new Audio(silentWavUrl());
+  if (sessionAudio) {
+    if (!sessionAudio.hasAttribute("src")) sessionAudio.src = SESSION_AUDIO_URL;
+    return sessionAudio;
+  }
+  sessionAudio = new Audio(SESSION_AUDIO_URL);
   sessionAudio.loop = true;
   sessionAudio.preload = "auto";
   sessionAudio.playsInline = true;
@@ -1861,8 +1878,10 @@ function pauseSessionAudio() {
 function stopSessionAudio() {
   if (sessionAudio) {
     sessionAudio.pause();
-    sessionAudio.currentTime = 0;
+    sessionAudio.removeAttribute("src");
+    sessionAudio.load();
   }
+  if (runtime?.status === "complete" && lockBellAudio?.paused) releaseLockBellPlayback();
   if ("mediaSession" in navigator) {
     navigator.mediaSession.playbackState = "none";
     navigator.mediaSession.metadata = null;

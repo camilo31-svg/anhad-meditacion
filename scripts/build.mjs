@@ -8,7 +8,7 @@ const serverDir = join(distDir, "server");
 const clientDir = join(distDir, "client");
 if (distDir !== join(root, "dist")) throw new Error("Unexpected build directory");
 
-const rootAssets = ["index.html", "styles.css", "app.js", "core.js", "manifest.webmanifest", "service-worker.js"];
+const rootAssets = ["index.html", "styles.css", "app.js", "core.js", "manifest.webmanifest", "service-worker.js", "session-hold.wav"];
 const publicAssets = ["og.png", "icon-192.png", "icon-512.png"];
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -16,7 +16,8 @@ const mimeTypes = {
   ".js": "text/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".webmanifest": "application/manifest+json; charset=utf-8",
-  ".png": "image/png"
+  ".png": "image/png",
+  ".wav": "audio/wav"
 };
 
 await Promise.all(rootAssets.map((file) => readFile(join(root, file))));

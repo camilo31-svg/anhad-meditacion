@@ -1,4 +1,4 @@
-const CACHE_NAME = "anhad-offline-v9";
+const CACHE_NAME = "anhad-offline-v10";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -6,6 +6,7 @@ const APP_SHELL = [
   "./app.js",
   "./core.js",
   "./manifest.webmanifest",
+  "./session-hold.wav",
   "./icon-192.png",
   "./icon-512.png",
   "./og.png"
